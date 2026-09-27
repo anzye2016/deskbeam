@@ -1,0 +1,3 @@
+# Shell scripts must stay LF — CRLF breaks them on Linux
+*.sh text eol=lf
+*.service text eol=lf

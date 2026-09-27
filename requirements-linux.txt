@@ -1,0 +1,5 @@
+websockets>=12
+av>=10
+numpy
+opencv-python-headless; platform_system != "Windows" and machine != "armv7l"
+python-xlib; platform_system != "Windows"

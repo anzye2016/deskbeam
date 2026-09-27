@@ -1,0 +1,6 @@
+websockets>=13.0
+dxcam>=0.3.0
+av>=14.0
+numpy>=2.0
+aiortc>=1.15.0
+opencv-python-headless>=4.8

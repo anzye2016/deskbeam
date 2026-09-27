@@ -1,0 +1,33 @@
+# DeskBeam systemd template (UBUNTU_PORT_PLAN.md P4).
+# System unit started after the display manager brings up the Xorg session.
+# Adjust User / WorkingDirectory for the target machine.
+#
+#   sudo cp deskbeam.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now deskbeam
+#
+# Requires an active Xorg session on :0 (WaylandEnable=false in
+# /etc/gdm3/custom.conf — see plan §5). start.sh auto-detects the GDM
+# XAUTHORITY and reuses the project venv, so ExecStart points at it.
+
+[Unit]
+Description=DeskBeam remote desktop server
+After=graphical.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user>
+Group=<user>
+Environment=DISPLAY=:0
+WorkingDirectory=/home/<user>/DeskBeam
+# wait up to 30s for the Xorg socket before starting (slow boots / autologin)
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -S /tmp/.X11-unix/X0 ] && exit 0; sleep 1; done; exit 1'
+ExecStart=/home/<user>/DeskBeam/start.sh
+# always: restarts even on clean exit (e.g. the web UI Shutdown button),
+# while `systemctl stop` still stops it for good (operator-initiated).
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, interactive-widget=resizes-content">
+<link rel="icon" href="icon.png"><title>DeskBeam</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="bar">
+  <span id="st">CONNECTING</span>
+  <span id="pz" style="display:none"><button class="ctl" id="zo">-</button><span class="zoom-lbl" id="zl">Fit</span><button class="ctl" id="zi">+</button></span>
+  <button class="bk-mini" id="be" title="Mouse Right">R</button>
+  <button class="bk-mini" id="bs" title="Scroll Up">▲</button>
+  <button class="bk-mini" id="rr" title="Scroll Down">▼</button>
+  <button class="mode-btn" id="mb">REMOTE</button>
+</div>
+<div class="touch" id="ta" tabindex="-1">
+  <div id="ph"></div>
+  <div class="scroll-wrap" id="sw"><canvas id="cv"></canvas><video id="vd" style="display:none;max-width:100%" muted autoplay playsinline></video></div>
+  <div class="screen-msg" id="pmsg"><b>安全桌面</b><br>检测到 UAC / 锁屏，画面已暂停<br>请在电脑上完成操作</div>
+</div>
+<div class="mouse" id="mc"></div>
+<div class="input-row">
+  <textarea id="ti" placeholder="Type here..." rows="3"></textarea>
+  <button class="rec" id="rc">REC</button><button class="send" id="sn">Send</button>
+</div>
+<div class="keys" id="ks"></div>
+<div class="gyro-page" id="gyroPage">
+  <div class="bar">
+    <span id="gex" class="gyro-live">LIVE</span>
+    <span class="gyro-status-wrap">
+      <span id="gyroStatus" class="gyro-status off">GYRO</span>
+      <span id="ggb" class="gyro-g">GAME</span>
+      <span id="gcal" class="gyro-g">校准</span>
+      <span id="gax" class="gyro-g">L</span>
+    </span>
+    <span class="gyro-cam-wrap"><button class="gyro-cam-btn" id="gcb">VIDEO</button></span>
+  </div>
+  <div class="touch" id="gta" tabindex="-1">
+    <div class="scroll-wrap" id="gsw">
+      <canvas id="gc"></canvas>
+      <video id="gv" style="display:none;max-width:100%" muted autoplay playsinline></video>
+      <div class="gyro-cam-msg" id="gmsg">NO VIDEO</div>
+    </div>
+    <div class="gyro-stick" id="gstick">
+      <div class="gyro-stick-knob" id="gstickKnob"></div>
+    </div>
+  </div>
+  <div class="input-row">
+    <textarea id="gti" placeholder="Type here..." rows="3"></textarea>
+    <button class="rec" id="grc">REC</button><button class="send" id="gsn">Send</button>
+  </div>
+  <div class="mouse" id="gmc">
+    <div class="gyro-sens">
+      <span class="gyro-sens-label">左右</span><span class="gyro-sens-val" id="gsxv"></span>
+      <input id="gsx" type="range" min="1" max="60">
+      <span class="gyro-sens-label">上下</span><span class="gyro-sens-val" id="gsyv"></span>
+      <input id="gsy" type="range" min="1" max="60">
+    </div>
+    <div class="gcol" id="gcl"></div>
+    <div class="gcol" id="gcr"></div>
+  </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
