@@ -41,6 +41,7 @@
     "esp_token": "",
     "esp_device": "",
     "esp_lock_password": "",
+    "esp_lock_enter": false,
     "ice_servers": [],
     "rtp_pacer_mbps": 0
 }

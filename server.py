@@ -923,6 +923,7 @@ async def ws_cmd_handler(websocket):
         "token": _cfg.get("esp_token", ""),
         "device": _cfg.get("esp_device", ""),
         "lockPassword": _cfg.get("esp_lock_password", ""),
+        "lockEnter": bool(_cfg.get("esp_lock_enter", False)),
     }
     lan = _is_lan(ip)
     # 经 SSH 反向隧道访问时 socket peer 是 127.0.0.1 且带 nginx 的 X-Real-IP,

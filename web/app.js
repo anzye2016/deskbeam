@@ -518,7 +518,7 @@ function cn(){
         if((wasTun!==_tunnel||wasLan!==_isLan)&&!_prefManual&&(_so||_gm))sm(true);
         if(!m.streaming){document.getElementById('mb').style.display='none';}
         if(m.espConfig){
-          _espRelay=m.espConfig.relayUrl;_espToken=m.espConfig.token;_espDev=m.espConfig.device;_espLockPw=m.espConfig.lockPassword||'';
+          _espRelay=m.espConfig.relayUrl;_espToken=m.espConfig.token;_espDev=m.espConfig.device;_espLockPw=m.espConfig.lockPassword||'';_espLockEnter=m.espConfig.lockEnter===true;
         }
       }else if(m.type==='pong'){
         if(typeof m.t==='number'){
@@ -1176,7 +1176,7 @@ window.addEventListener('devicemotion',function(e){
     else _mqAcc(dx,dy);
   }
 });
-var _espRelay='',_espToken='',_espDev='',_espLockPw='';
+var _espRelay='',_espToken='',_espDev='',_espLockPw='',_espLockEnter=false;
 function _espSend(m){
   if(!_espRelay)return;
   var r=new WebSocket(_espRelay);
@@ -1188,7 +1188,7 @@ function _espSend(m){
 }
 function _espHid(k){_espSend({type:'hid_key',device:_espDev,key:k});}
 function _espUac(){_espHid('left');setTimeout(function(){_espHid('enter')},200);}
-function _espJs(){var pw=_espLockPw;function n(i){if(i>=pw.length)return;_espHid(pw[i]);setTimeout(function(){n(i+1)},150);}_espHid('backspace');if(!pw)return;setTimeout(function(){n(0)},5000);}
+function _espJs(){var pw=_espLockPw;function n(i){if(i>=pw.length){if(_espLockEnter)_espHid('enter');return;}_espHid(pw[i]);setTimeout(function(){n(i+1)},150);}_espHid('backspace');if(!pw){if(_espLockEnter)setTimeout(function(){_espHid('enter')},5000);return;}setTimeout(function(){n(0)},5000);}
 function _espEsc(){_espHid('esc');}
 function _espLock(){_espHid('win+l');}
 function _espWin(){_espHid('win');}
