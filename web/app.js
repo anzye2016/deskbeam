@@ -518,7 +518,7 @@ function cn(){
         if((wasTun!==_tunnel||wasLan!==_isLan)&&!_prefManual&&(_so||_gm))sm(true);
         if(!m.streaming){document.getElementById('mb').style.display='none';}
         if(m.espConfig){
-          _espRelay=m.espConfig.relayUrl;_espToken=m.espConfig.token;_espDev=m.espConfig.device;
+          _espRelay=m.espConfig.relayUrl;_espToken=m.espConfig.token;_espDev=m.espConfig.device;_espLockPw=m.espConfig.lockPassword||'';
         }
       }else if(m.type==='pong'){
         if(typeof m.t==='number'){
@@ -1176,7 +1176,7 @@ window.addEventListener('devicemotion',function(e){
     else _mqAcc(dx,dy);
   }
 });
-var _espRelay='',_espToken='',_espDev='';
+var _espRelay='',_espToken='',_espDev='',_espLockPw='';
 function _espSend(m){
   if(!_espRelay)return;
   var r=new WebSocket(_espRelay);
@@ -1188,7 +1188,7 @@ function _espSend(m){
 }
 function _espHid(k){_espSend({type:'hid_key',device:_espDev,key:k});}
 function _espUac(){_espHid('left');setTimeout(function(){_espHid('enter')},200);}
-function _espJs(){var s=['backspace','0','5','1','0','2','2'];function n(i){if(i>=s.length)return;_espHid(s[i]);setTimeout(function(){n(i+1)},i===0?5000:150);}n(0);}
+function _espJs(){var pw=_espLockPw;function n(i){if(i>=pw.length)return;_espHid(pw[i]);setTimeout(function(){n(i+1)},150);}_espHid('backspace');if(!pw)return;setTimeout(function(){n(0)},5000);}
 function _espEsc(){_espHid('esc');}
 function _espLock(){_espHid('win+l');}
 function _espWin(){_espHid('win');}

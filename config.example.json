@@ -40,6 +40,7 @@
     "esp_relay_url": "",
     "esp_token": "",
     "esp_device": "",
+    "esp_lock_password": "",
     "ice_servers": [],
     "rtp_pacer_mbps": 0
 }
