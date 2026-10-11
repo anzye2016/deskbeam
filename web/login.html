@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<link rel="icon" href="icon.png"><title>DeskBeam</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body {
+  height: 100%;
+  background: #0A0A0A;
+  color: #D4D4D4;
+  font-family: 'JetBrains Mono', 'SF Mono', monospace;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 280px;
+}
+h1 {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #71717A;
+  text-align: center;
+  margin-bottom: 8px;
+}
+input {
+  width: 100%;
+  padding: 10px 14px;
+  background: #121212;
+  border: 1px solid #2A2A2A;
+  color: #EAEAEA;
+  font-family: inherit;
+  font-size: 14px;
+  outline: none;
+  -webkit-appearance: none;
+}
+input:focus { border-color: #3B82F6; }
+button {
+  width: 100%;
+  height: 40px;
+  border: 1px solid #3B82F6;
+  background: #121212;
+  color: #3B82F6;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+}
+button:active { background: #3B82F6; color: #0A0A0A; }
+#err {
+  color: #E61919;
+  text-align: center;
+  min-height: 16px;
+  font-size: 12px;
+}
+</style>
+</head>
+<body data-totp="__TOTP__">
+<form id="login-form">
+  <h1>DeskBeam</h1>
+  <input type="password" id="token" name="token" placeholder="Token" autofocus>
+  <input type="text" id="totp" name="totp" placeholder="2FA code" inputmode="numeric" maxlength="6" style="display:none">
+  <button type="submit">Enter</button>
+  <p id="err"></p>
+</form>
+<script>
+const form = document.getElementById('login-form');
+const err = document.getElementById('err');
+const totpInput = document.getElementById('totp');
+const totpEnabled = document.getElementById('login-form').dataset.totp || document.body.dataset.totp || '__TOTP__';
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  err.textContent = '';
+  const token = document.getElementById('token').value;
+  if (!token) { err.textContent = 'Token required'; return; }
+  const code = totpInput.value.trim();
+  const base = new URL('.', location.href).pathname.replace(/\/+$/, '');
+  const headers = { 'X-Auth-Token': token };
+  if (code) headers['X-Totp-Code'] = code;
+  const res = await fetch(base + '/login', { headers });
+  if (res.redirected && res.url.endsWith('/')) {
+    window.location.href = base + '/';
+  } else if (res.status === 429) {
+    err.textContent = 'Too many attempts. Blocked for 24h';
+  } else if (res.status === 426) {
+    // TOTP enabled: ask for the 6-digit code
+    totpInput.style.display = '';
+    totpInput.focus();
+    err.textContent = 'Enter your 2FA code';
+  } else {
+    err.textContent = 'Invalid token or code';
+  }
+});
+</script>
+</body>
+</html>
