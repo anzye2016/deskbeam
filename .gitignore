@@ -22,3 +22,5 @@ audit.log
 
 frp/frpc.exe
 ffmpeg/
+config.json.bak*
+*.bak-*

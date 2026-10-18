@@ -28,6 +28,9 @@ function _mkShiftBtn(sh){
 }
 var ks=document.getElementById('ks');
 function _mkBtn(spec){
+  if(spec.espHold)return _mkEspHold(spec);      /* ESP:按住时重发 hid_key(方向键/空格) */
+  if(spec.espRepeat)return _mkEspRepeat(spec);  /* ESP:按住时重发任意动作(滚动/退格) */
+  if(spec.espBtnHold)return _mkEspBtnHold(spec);/* ESP:鼠标键按下锁存(hold:1/2) */
   var b=document.createElement('button');b.className='k';b.textContent=spec.t;
   if(spec.m==='hold'){_bindHoldEl(b,spec.d,spec.u,spec.nc||false,spec.nr);}
   else if(spec.fn){_tapEl(b,spec.fn);}
@@ -42,20 +45,21 @@ var _MOUSE=[
   {t:'⌫',m:'hold',d:{type:'key_press',key:'backspace'},u:null,nc:true,nr:false},{t:'Enter',c:'enter'},
 ];
 var _KEYS=[
-  {t:'Ctrl+C',c:'ctrl_c'},{t:'Esc',c:'esc'},{t:'Ctrl+V',c:'ctrl_v'},
-  {t:'Drag',fn:function(){_dm=!_dm;var b=this;b.style.color=_dm?'var(--green)':'';b.style.borderColor=_dm?'var(--green)':'';if(_dm)sendCmd({type:'mouse_down'});else sendCmd({type:'mouse_up'});}},
-  {t:'Space',m:'hold',d:{type:'key_press',key:'space'},u:null,nr:false},
-  {t:'Win',c:'win'},{t:'F5',c:'f5'},{t:'Ctrl+F5',c:'ctrl_f5'},{t:'Ctrl+J',c:'ctrl_j'},
-  {t:'Shift+Enter',c:'shift_enter'},{t:'F12',c:'f12'},
-  {t:'UAC',fn:_espUac},{t:'JS',fn:_espJs},{t:'ESP ESC',fn:_espEsc},{t:'Lock',fn:_espLock},
-  {t:'ESP Win',fn:_espWin},{t:'ESP L',fn:_espL},
+  {t:'Drag',fn:_dragToggle},
+  /* Space 必须是**真按住**:原来用 key_press(按下+立即抬起的脉冲),打字够用,
+     但游戏是轮询『键当前是否按下』的,几微秒的脉冲抓不到 -> 跳跃无效。
+     GYRO 页的 SPACE 一直是 key_down/up,所以那边有效;ESP 那边固件每条 hid_key
+     会按住 50ms,也够长。nr:true —— 真按住时系统自带自动重复,不必我们再发脉冲。
+     断线时服务端 _release_held 会补 key_up,不会卡住。 */
+  {t:'Space',m:'hold',d:{type:'key_down',key:'space'},u:{type:'key_up',key:'space'},nr:true},
+  {t:'Esc',c:'esc'},
   {t:'↑',m:'hold',d:{type:'key_down',key:'up'},u:{type:'key_up',key:'up'},nr:true,nc:true},
   {t:'↓',m:'hold',d:{type:'key_down',key:'down'},u:{type:'key_up',key:'down'},nr:true,nc:true},
   {t:'←',m:'hold',d:{type:'key_down',key:'left'},u:{type:'key_up',key:'left'},nr:true,nc:true},
   {t:'→',m:'hold',d:{type:'key_down',key:'right'},u:{type:'key_up',key:'right'},nr:true,nc:true},
 ];
-var _mc=document.getElementById('mc');_MOUSE.forEach(function(s){_mc.appendChild(_mkBtn(s));});
-_KEYS.forEach(function(s){ks.appendChild(_mkBtn(s));});
+/* 按钮行的初始化搬到文件末尾(_initBtnRows):那两行要等 _MOUSE_ESP / _KEYS_ESP
+   都赋值完才能跑,而 var 的赋值不提升,提前调用会拿到 undefined。 */
 var cv=document.getElementById('cv'),sw=document.getElementById('sw'),ta=document.getElementById('ta'),ti=document.getElementById('ti');
 var st=document.getElementById('st');
 
@@ -474,6 +478,10 @@ function _startScreenVideo(){
 function sm(on){
   _so=on;mb.textContent=on?'SCREEN':'REMOTE';mb.className='mode-btn'+(on?' on':'');document.body.classList.toggle('screen',on);
   if(on){
+    /* 让帧停滞看门狗从**会话开始**就生效。否则 _lastFrameAt=0,而 _frameStall 在
+       `!_lastFrameAt` 时直接 return -> "首次打开就没收到任何帧"这种最该救的场景
+       反而没人管,只能等 13s 协商超时或者手动刷新(极小概率,但确实发生过)。 */
+    _lastFrameAt=performance.now();
     sw.style.overflow='hidden';document.getElementById('ph').style.display='none';
     document.getElementById('pz').style.display='';document.getElementById('ph').innerHTML='';_fts=[];
     if(wsV&&wsV.readyState===WebSocket.OPEN){
@@ -574,8 +582,37 @@ function _openPanel(){
   g.style.cssText='flex:1;height:36px;border:1px solid var(--border);background:var(--surface);color:'+(_gm?'var(--green)':'var(--dim)')+';font-family:inherit;font-size:12px;cursor:pointer';
   g.onclick=function(){d.remove();_gyToggle();};
   rowG.appendChild(g);
+  /* 本地 ASR 开关:放在 GYRO 与 DARK 之间。状态存在**服务端**(config.json 的
+     asr_local_enabled),所以刷新浏览器、重启服务都保持 —— 不用 localStorage。 */
+  var asB=document.createElement('button');
+  var _asrLocal=true;
+  /* **不靠颜色区分**:按钮文字直接显示当前走哪条路(本地ASR / 在线ASR),
+     配色与同排其它按钮一致(不绿)。 */
+  var _paintAsr=function(){
+    asB.textContent=_asrLocal?'本地ASR':'在线ASR';
+    asB.title=_asrLocal
+      ?'当前:本地优先(本地失败会回退在线)。点一下 -> 只用在线'
+      :'当前:只用在线 API。点一下 -> 切回本地优先';
+    asB.style.cssText='flex:1;height:36px;border:1px solid var(--border);background:var(--surface);'
+      +'color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer';
+  };
+  _paintAsr();
+  asB.onclick=function(){
+    var want=!_asrLocal;
+    fetch(_BASE+'/asr_local?on='+(want?'1':'0'),{credentials:'include',cache:'no-store'})
+      .then(function(r){return r.ok?r.text():null;})
+      .then(function(t){if(t){_asrLocal=t.indexOf('on')===0;_paintAsr();}})
+      .catch(function(){});
+  };
+  rowG.appendChild(asB);
+  fetch(_BASE+'/asr_local',{credentials:'include',cache:'no-store'})
+    .then(function(r){return r.ok?r.text():null;})
+    .then(function(t){if(t){_asrLocal=t.indexOf('on')===0;_paintAsr();}})
+    .catch(function(){});
   var th=document.createElement('button');
-  th.textContent=document.documentElement.classList.contains('dark')?'LIGHT':'DARK';
+  /* 显示**当前模式**(与 本地ASR 按钮一致):暗色就显示 DARK,亮色显示 LIGHT。
+   原来是显示"点了会变成什么"(暗色时显示 LIGHT),容易看反。 */
+th.textContent=document.documentElement.classList.contains('dark')?'DARK':'LIGHT';
   th.style.cssText='flex:1;height:36px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer';
   th.onclick=function(){d.remove();_toggleTheme()};
   rowG.appendChild(th);
@@ -652,6 +689,11 @@ function _openPanel(){
 }
 var _zi=0,Z=['Fit','Full'],ZF=[0,-1];
 function zs(i){
+  /* 切档位会隐藏整行(Full 档 .mouse/.keys 都 display:none)。如果此时正按着某个
+     按钮,必须主动释放 —— 不能只指望浏览器在被隐藏时补发 pointercancel(不保证)。
+     ESP 的 hold 是固件里的持久状态,漏一次就会一直按住。 */
+  try{_releaseRowHolds();}catch(_){}
+  try{_espReleaseHolds();}catch(_){}
   _zi=Math.max(0,Math.min(Z.length-1,i));var z=ZF[_zi];
   document.body.classList.toggle('full',z<0);
   _zReset();
@@ -752,6 +794,7 @@ function cnV(){
       try{
         var m=JSON.parse(e.data);
         if(m.type==='screen_config'){
+          _setNoSignal(false);       /* 开始推流了,把"无输出"提示收掉 */
           _encName=m.enc||'';
           _setupDecoder(m);
           /* 服务端只在 RTP 路径建音轨;TCP/WebRTC 兜底一律 audio:false。
@@ -771,6 +814,8 @@ function cnV(){
              下次打开会读到新的 _audioDev。 */
           _audioDev=m.device||'';
           _paintSrc();
+        }else if(m.type==='screen_no_signal'){
+          _setNoSignal(true);
         }else if(m.type==='screen_paused'){
           _setPaused(true);
         }else if(m.type==='screen_resumed'){
@@ -975,16 +1020,18 @@ function _rtpRecv(m){
   }).catch(function(ex){console.error('RTP answer:',ex);_rtpFail();});
 }
 function _rtpFail(){
+  try{console.warn('RTP fail -> fallback (retry='+_rtpRetry+', ws='+(wsV&&wsV.readyState)+')');}catch(_){}
   _teardownRtp();
   _rtpMode=false;
   /* 只回退不粘死:不再改 _prefManual/RTPPref——一次失败就锁死 TCP 会让
      本会话怎么点都回不到 UDP,只有刷新页面(内存偏好重置)才行。现在失败
      后自动选择、下次点击或重连都仍可重试 UDP。 */
-  if(_rtpRetry++<1){
-    // 兜底切回 TCP 串流
-    if(wsV&&wsV.readyState===WebSocket.OPEN){
-      wsV.send(JSON.stringify({type:'set_mode',screen:true}));
-    }
+  /* 只有**真正发出去**才算用掉这次兜底。原来先 `_rtpRetry++` 再判断 WS 是否 OPEN:
+     WS 正在重连的瞬间发不出去,次数却被用掉 -> 之后 30 秒内再没有 TCP 兜底,
+     只能刷新页面(与"极小概率打开就没画面"的现象一致)。 */
+  if(_rtpRetry<1&&wsV&&wsV.readyState===WebSocket.OPEN){
+    _rtpRetry++;
+    wsV.send(JSON.stringify({type:'set_mode',screen:true}));
   }
   setTimeout(function(){_rtpRetry=0;},30000);
 }
@@ -1143,6 +1190,7 @@ var _aRttS=0,_aRttN=0,_aFrame=0,_aDd=0,_aDr=0,_aBufS=0,_aBufN=0,_aDrawS=0,_aDraw
 var _stEl=document.getElementById('st'),_netSpan=null;
 if(_stEl&&_stEl.parentNode){
   _netSpan=document.createElement('span');
+  _netSpan.className='net-info';      /* Full 档据此隐藏 */
   _netSpan.style.cssText='margin-left:6px;color:var(--dim);font-size:10px';
   _netSpan.style.cursor='pointer';
   _netSpan.title='点击切换详细统计';
@@ -1240,6 +1288,29 @@ function _setPaused(on){
   }
   if(el)el.className='screen-msg'+(on?' on':'');
   if(on)_lastFrameAt=performance.now();
+}
+/* 「无活动显示输出」提示。服务端采集建立不起来时会推 screen_no_signal ——
+   **注意措辞要通用**:可能是 HDMI/DP 线没插、显示器断电、也可能是没有接显示器
+   (需要虚拟显示器或 EDID 假负载)。别写死 HDMI。 */
+var _noSig=false;
+function _setNoSignal(on){
+  if(_noSig===on)return;
+  _noSig=!!on;
+  var el=document.getElementById('pmsg');
+  if(!el){
+    var ta=document.getElementById('ta');
+    if(ta){el=document.createElement('div');el.id='pmsg';el.className='screen-msg';ta.appendChild(el);}
+  }
+  if(!el)return;
+  if(on){
+    el.innerHTML='<b>未检测到活动显示输出</b><br>'
+      +'请检查显示输出的连接与电源；<br>'
+      +'若无物理显示器，可启用虚拟显示器或使用 EDID 假负载';
+    el.className='screen-msg on';
+  }else{
+    el.innerHTML='';
+    el.className='screen-msg';
+  }
 }
 /* 媒体路径重建:连接与输入通道全部保留,只把视频管线重来一遍。
    画面停了但 socket 还活着时,重连整个会话代价过大(重新协商 + 重新认证 +
@@ -1351,11 +1422,38 @@ function _twoInTa(e){
   }
   return true;
 }
+/* ── 主页:长按 350ms = 自动按住左键(与 GYRO 一致) ─────────────────────
+   主页比 GYRO 多几个坑:
+   * **与 _dm(拖拽锁定)互斥** —— _dm 时 touchstart 已经发 mouse_down、touchend 发
+     mouse_up;长按再发一次 down 就变成"两次 down、一次 up",左键会卡住。
+   * **第二根手指落下就取消** —— 双指缩放不能顺手按下左键。
+   * **#tpmsg("点击播放"覆盖层)不参与** —— 它要浏览器的原生 click。
+   长按释放后**不再发 click**,并重置双击计时(_lt)。 */
+var _hT=null,_hHeld=false,_px0=0,_py0=0;
+function _hClear(){if(_hT){clearTimeout(_hT);_hT=null;}}
+function _hRelease(){if(_hHeld){_hHeld=false;sendCmd({type:'mouse_up'});}}
+function _hArm(){
+  _hClear();
+  if(_dm)return;
+  _px0=_px;_py0=_py;_hHeld=false;
+  _hT=setTimeout(function(){
+    _hT=null;
+    if(_hHeld||_mv)return;
+    _hHeld=true;
+    sendCmd({type:'mouse_down'});
+  },350);
+}
 ta.addEventListener('touchstart',function(e){
+  /* 触摸区**彻底关掉浏览器的原生长按识别** —— 只加 user-select/contextmenu 还不够,
+     手机仍会有长按振动反馈(实测)。代价是浏览器不再为这块区域合成 click 事件;
+     我们的单击是自己在 touchend 里实现的,不受影响。
+     #tpmsg("点击播放"覆盖层)必须例外:它需要浏览器合成的 click。 */
+  if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))e.preventDefault();
   if(_tt){clearTimeout(_tt);_tt=null;}
   _pinchEnded=false;
   if(_pinching)return;                       /* 手势进行中：忽略新增触点，避免重算锚点 */
   if(_twoInTa(e)&&_so){
+    _hClear();
     _pinching=true;
     var a=e.touches[0],b=e.touches[1];
     _ps=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY);
@@ -1366,7 +1464,16 @@ ta.addEventListener('touchstart',function(e){
     _aP=(_cx0-_ox-_tx0)/_k0;_bP=(_cy0-_oy-_ty0)/_k0;  /* 起始时压在手指下的内容点 */
     return;
   }
-  var t=e.touches[0];_px=t.clientX;_py=t.clientY;_mv=false;if(_dm)sendCmd({type:'mouse_down'});
+  /* **用 changedTouches 而不是 touches**:`e.touches` 是"全屏所有触点",按产生顺序排。
+     先按住左键、再用另一根手指滑触摸板时,touches[0] 是**按左键那根手指**(它不动),
+     于是起点被记在左键按钮的位置上,之后 touchmove 的 touches[0] 还是它 -> dx/dy 恒为 0
+     -> 光标完全不动(用户实测:"反过来先按住左键再滑动触摸板就不行")。
+     记住这根手指的 identifier,touchmove 里按 identifier 找它,第几根手指按的都一样。 */
+  var t=e.changedTouches[0];_tid0=t.identifier;_px=t.clientX;_py=t.clientY;_mv=false;if(_dm)sendCmd({type:'mouse_down'});
+  /* 只有**第一根**手指才武装长按:第二根手指落下时清掉计时器,并且**不再重新武装**
+     (否则双指缩放/双指操作会顺手把左键按下去 —— 实测踩到过)。 */
+  if(e.touches.length>1){ _hClear(); }
+  else if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))_hArm();
 },{passive:false});
 ta.addEventListener('touchmove',function(e){
   e.preventDefault();
@@ -1383,11 +1490,19 @@ ta.addEventListener('touchmove',function(e){
     _zApply();
     return;
   }
-  var t=e.touches[0],dx=Math.round((t.clientX-_px)*4),dy=Math.round((t.clientY-_py)*4);
+  var t=null;
+  for(var _ti=0;_ti<e.touches.length;_ti++)if(e.touches[_ti].identifier===_tid0){t=e.touches[_ti];break;}
+  if(!t)t=e.changedTouches[0];                 /* 跟踪的那根抬起了:退化为本次移动的手指 */
+  if(!_hHeld&&_hT&&(Math.abs(t.clientX-_px0)>8||Math.abs(t.clientY-_py0)>8)){
+    _mv=true;_hClear();            /* 离起点够远:这是要拖光标,不是长按 */
+  }
+  var dx=Math.round((t.clientX-_px)*4),dy=Math.round((t.clientY-_py)*4);
   if(Math.abs(dx)<2&&Math.abs(dy)<2)return;_px=t.clientX;_py=t.clientY;_mv=true;
   _mqAcc(dx,dy);
 },{passive:false});
 ta.addEventListener('touchend',function(e){
+  _hClear();
+  if(_hHeld){ _hRelease(); _te=Date.now(); _lt=0; return; }   /* 长按:只 down+up,不 click */
   if(_pinching){
     if(e.touches.length<2){
       _pinching=false;_pinchEnded=true;
@@ -1405,7 +1520,7 @@ ta.addEventListener('touchend',function(e){
       if(Date.now()-_lt<500){sendCmd({type:'mouse_double_click'});_lt=0;return;}
       if(document.body.classList.contains('full')){sendCmd({type:'mouse_click'});}
       else if(_rw&&_rh&&_vidEl().style.display!=='none'&&_vidEl().getBoundingClientRect){
-        var _ve=_vidEl(),t=e.changedTouches[0],rect=_ve.getBoundingClientRect(),ix=rect.left,iy=rect.top,iw=rect.width,ih=rect.height;
+        var _ve=_vidEl(),t=e.changedTouches[0],rect=_contentRect(_ve),ix=rect.left,iy=rect.top,iw=rect.width,ih=rect.height;
         if(t.clientX>=ix&&t.clientX<=ix+iw&&t.clientY>=iy&&t.clientY<=iy+ih)
           sendCmd({type:'mouse_click_at',x:Math.round((t.clientX-ix)/iw*_rwr),y:Math.round((t.clientY-iy)/ih*_rhr)});
         else sendCmd({type:'mouse_click'});
@@ -1414,9 +1529,28 @@ ta.addEventListener('touchend',function(e){
     },20);
   }
 },{passive:false});
+ta.addEventListener('touchcancel',function(){_hClear();_hRelease();},{passive:true});
 ta.addEventListener('mousemove',function(e){var dx=e.movementX||0,dy=e.movementY||0;if(_gy)return;if(_mdP&&(Math.abs(e.clientX-_mdX)>5||Math.abs(e.clientY-_mdY)>5))_mdP=false;if(!(e.buttons&1))return;if(!dx&&!dy)return;_mqAcc(dx*4,dy*4);});
 ta.addEventListener('mousedown',function(e){if(e.button!==0)return;ta.focus();_mdP=true;_mdX=e.clientX;_mdY=e.clientY;});
 ta.addEventListener('mouseup',function(e){var wasClick=_mdP&&e.button===0;_mdP=false;if(wasClick&&Date.now()-_te>300){sendCmd({type:'mouse_down'});sendCmd({type:'mouse_up'});}});
+/* 触摸区长按不能弹系统菜单(Android 上会连带振动反馈)。输入框/文本域要保留
+   系统的粘贴菜单,所以只拦触摸区。 */
+(function(){
+  ['ta','gta','sw','gsw'].forEach(function(id){
+    var el=document.getElementById(id);
+    if(!el)return;
+    el.addEventListener('contextmenu',function(e){
+      if(e.target&&/INPUT|TEXTAREA/.test(e.target.tagName))return;
+      e.preventDefault();
+    });
+    el.addEventListener('dragstart',function(e){e.preventDefault();});
+  });
+  ['vd','gv','cv','gc'].forEach(function(id){
+    var el=document.getElementById(id);
+    if(el){ try{ el.draggable=false; }catch(_){} el.setAttribute&&el.setAttribute('draggable','false'); }
+  });
+})();
+
 function sendCmd(obj){
   var s=JSON.stringify(obj);
   if(_rtcDc&&_rtcDc.readyState==='open')_rtcDc.send(s);
@@ -1496,7 +1630,6 @@ function _gyEnter(){
 }
 function _gyExit(){
   _gm=false;
-  if(_gtt===1){sendCmd({type:'mouse_up'});_gtt=0;}
   if(_gShRel)_gShRel();
   /* 这里原来还有一行 `if(_gShRel2)_gShRel2();` —— 但 `_gShRel2` 从未被赋值过(死钩子),
      清理时只删了它的「声明」而留下了这处「读」,于是变成 ReferenceError:
@@ -1504,7 +1637,10 @@ function _gyExit(){
      全都执行不到 —— 表现就是"进了 GYRO 就退不出来"。只删声明不删使用,
      会把死代码变成运行时崩溃。 */
   _gHoldUp.forEach(function(h){
-    if(h.el.classList.contains('pressed')){h.el.classList.remove('pressed');sendCmd(h.up);}
+    /* h.up 是"释放函数"(_bindHoldEl 里的 su),不是命令对象 —— 原来写成
+       sendCmd(h.up) 等于把一个函数当命令发(JSON.stringify 后是 undefined),
+       按住的键因此永远放不掉。这里直接调用。 */
+    if(h.el&&h.el.classList.contains('pressed')){h.el.classList.remove('pressed');try{h.up();}catch(_){}}
   });
   _gyStop();
   document.getElementById('gyroPage').classList.remove('on');
@@ -1581,14 +1717,48 @@ window.addEventListener('devicemotion',function(e){
   }
 });
 var _espRelay='',_espToken='',_espDev='',_espLockPw='',_espLockEnter=false;
+/* ESP 通道:**复用一条长连接**,不再每条消息新开一个 WS。
+   原来每条消息都会 new WebSocket -> register -> send -> 500ms 后关闭。按键单点时还能凑合,
+   但 ESP 版的"按住类"(方向键/空格)是每 80ms 重发一次 -> **每秒 12.5 个连接**,
+   每个都要 TCP+TLS 握手到 relay(部署在华东),而且浏览器对同一 host 的并发连接数
+   有上限(~6,握手中的也算) -> 突发时会排队,按键延迟甚至乱序。
+   现在:首次发送时惰性建连,onopen 里发 register 并冲刷队列;断了自己下次再建;
+   队列有界(丢了最旧的),relay 挂掉也不会无限涨。 */
+var _espWS=null,_espQ=[],_espTry=0;
+function _espOpen(){
+  if(!_espRelay)return null;
+  if(_espWS&&(_espWS.readyState===0||_espWS.readyState===1))return _espWS;
+  var ws;
+  try{ws=new WebSocket(_espRelay);}catch(_){return null;}
+  _espWS=ws;
+  ws.onopen=function(){
+    _espTry=0;
+    try{ws.send(JSON.stringify({type:'register',token:_espToken}));}catch(_){}
+    /* 连上就先清一次鼠标"按住"锁存(照搬 esp-macro 网页的做法)。
+       hold:1 是**固件里的持久状态**:上一次会话如果被系统杀进程、或网络断了,
+       没人发 hold:2,鼠标会一直按住。这里无条件补一条 hold:2(幂等、代价可忽略),
+       于是下次连上时残留立刻被清掉。
+       当前正按着(_espHeldMask 非 0)时不发,免得把用户正在拖的键松开。 */
+    if(!_espHeldMask){
+      try{ws.send(JSON.stringify({type:'hid_mouse',device:_espDev,btn:0,hold:2}));}catch(_){}
+    }
+    /* 只补发最近 500ms 内的:relay 抖动期间攒下的旧按键**不要在重连后一起补发**,
+       否则会变成一波莫名其妙的按键风暴。 */
+    var q=_espQ;_espQ=[];var now=Date.now();
+    for(var i=0;i<q.length;i++){
+      if(q[i]&&(now-q[i].t)<=500){try{ws.send(q[i].s);}catch(_){}}
+    }
+  };
+  ws.onclose=function(){if(_espWS===ws)_espWS=null;};
+  ws.onerror=function(){};
+  return ws;
+}
 function _espSend(m){
   if(!_espRelay)return;
-  var r=new WebSocket(_espRelay);
-  r.onopen=function(){
-    r.send(JSON.stringify({type:'register',token:_espToken}));
-    r.send(JSON.stringify(m));
-    setTimeout(function(){try{r.close()}catch(_){}},500);
-  };
+  var s=JSON.stringify(m),ws=_espOpen();
+  if(ws&&ws.readyState===1){try{ws.send(s);return;}catch(_){}}
+  _espQ.push({s:s,t:Date.now()});
+  if(_espQ.length>40)_espQ.shift();      /* 有界:宁可丢最旧的一条,也不要涨到爆内存 */
 }
 function _espHid(k){_espSend({type:'hid_key',device:_espDev,key:k});}
 function _espUac(){_espHid('left');setTimeout(function(){_espHid('enter')},200);}
@@ -1610,39 +1780,61 @@ document.addEventListener('touchmove',function(e){if(!e.target.closest('#ks')&&!
 function _bindHoldEl(el,dcmd,ucmd,nocancel,norepeat){
   if(!el)return;
   var iv=null,to=null,pr=false,sx=0,sy=0,sl=false,sTid=-1;
+  /* **滑动防误触**:在可滑动行(.keys)里,按住类按钮不能在 touchstart 立刻下发 ——
+     实测横向滑过方向键会发 key_down。做法:延迟 80ms 下发,期间位移超 10px 就取消;
+     快速点击则在 touchend 时补发。滚动容器外的按钮(鼠标行 L/R 拖拽)保持立即响应。 */
+  /* **必须延迟到事件触发时再判断**:_mkBtn 是先建元素、再 appendChild,
+     绑定时元素还没进 DOM,closest('.keys') 必然返回 null —— 一开始写成绑定时判断,
+     于是 inScroll 恒为 false,滑动照样误触发(实测)。 */
+  var inScrollNow=function(){return !!(el.closest&&el.closest('.keys'));};
+  var pend=null,fired=false;
   var add=function(){el.classList.add('pressed');};
   var rem=function(){el.classList.remove('pressed');};
   var sd=function(){if(Array.isArray(dcmd))dcmd.forEach(function(c){sendCmd(c);});else sendCmd(dcmd);};
   var su=function(){if(!ucmd)return;if(Array.isArray(ucmd))ucmd.forEach(function(c){sendCmd(c);});else sendCmd(ucmd);};
+  var fireDown=function(){
+    if(fired)return; fired=true; add(); sd();
+    if(!norepeat)to=setTimeout(function(){to=null;iv=setInterval(sd,50);},350);
+  };
+  var cancelAll=function(){
+    if(pend){clearTimeout(pend);pend=null;}
+    if(to){clearTimeout(to);to=null;}
+    if(iv){clearInterval(iv);iv=null;}
+    if(fired){fired=false;su();}
+    pr=false; rem();
+  };
+  var arm=function(){
+    pr=true;
+    if(inScrollNow()){ add(); pend=setTimeout(function(){pend=null;fireDown();},80); }
+    else fireDown();
+  };
   var _tid=function(ts){var t;for(var i=0;i<ts.length;i++)if(ts[i].identifier===sTid){t=ts[i];break;}return t||ts[0];};
   var down=function(e){
     if(e.type==='touchstart'){
       var t=e.changedTouches[0];sx=t.clientX;sy=t.clientY;sTid=t.identifier;sl=false;
-      if(pr)return;pr=true;add();sd();
-      if(!norepeat)to=setTimeout(function(){to=null;iv=setInterval(sd,50);},350);
+      if(pr)return;arm();
     }else{
       e.preventDefault();
-      if(pr)return;pr=true;add();sd();
-      if(!norepeat)to=setTimeout(function(){to=null;iv=setInterval(sd,50);},350);
+      if(pr)return;arm();
     }
   };
   var mv=function(e){
     if(sl)return;
-    if(nocancel)return;
+    if(nocancel&&!inScrollNow())return;   /* 滚动容器里即使 nc:true 也要能取消 */
     var t=_tid(e.touches);
     if(t.identifier!==sTid)return;
     if(Math.abs(t.clientX-sx)>10||Math.abs(t.clientY-sy)>10){
-      sl=true;
-      if(pr){pr=false;rem();if(to){clearTimeout(to);to=null;}if(iv){clearInterval(iv);iv=null;}su();}
+      sl=true; cancelAll();
     }
   };
   var up=function(e){
     if(e.type==='touchend'&&sl)return;
     e.preventDefault();sTid=-1;rem();
     if(!pr)return;pr=false;
+    if(pend){clearTimeout(pend);pend=null;fireDown();}   /* 快速点击:补发一次按下 */
     if(to){clearTimeout(to);to=null;}
     if(iv){clearInterval(iv);iv=null;}
-    su();
+    fired=false; su();
   };
   _gHoldUp.push({el:el,up:su});
   if(!_isTouch){el.addEventListener('mousedown',down);el.addEventListener('mouseup',up);el.addEventListener('mouseleave',up);}
@@ -1752,9 +1944,41 @@ function _bindRec(b){
   b.addEventListener('touchcancel',function(e){e.preventDefault();if(_rr)re();});
 }
 var _recBtn=rc;_bindRec(rc);
-var bs=document.getElementById('bs');_bindHoldEl(bs,{type:'scroll_up'},null,true);
-var be=document.getElementById('be');_bindHoldEl(be,{type:'mouse_right_down'},{type:'mouse_right_up'},true,true);
-_bindHoldEl(rr,{type:'scroll_down'},null,true);
+/* Full 档(标题栏)的四颗快捷:L / R / 滚轮上 / 滚轮下。
+   **跟随鼠标行的 ESP 页**:那两行在 Full 档是 display:none,如果这四颗还只发
+   DeskBeam,Full 档下 ESP 就完全用不了。语义与鼠标行一致:
+   鼠标行在 ESP 页(且 relay 已配)-> 走 ESP;否则 -> DeskBeam。 */
+function _fullEspOn(){ return !!(_pg.mouse && _espRelay); }
+function _bindDual(el,opts){
+  if(!el)return;
+  var iv=null,pr=false;
+  var fireDesk=function(){ if(opts.desk)sendCmd(opts.desk); };
+  var fireEsp=function(){
+    if(opts.espHold)_espBtnHold(opts.espHold,true);
+    else _espMouse(opts.espWheel>0?{w:1}:{w:-1});
+  };
+  var down=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(pr)return;pr=true;el.classList.add('pressed');
+    if(_fullEspOn())fireEsp(); else fireDesk();
+    if(opts.repeat)iv=setInterval(function(){ if(_fullEspOn())fireEsp(); else fireDesk(); },opts.repeat);
+  };
+  var up=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(!pr)return;pr=false;el.classList.remove('pressed');
+    if(iv){clearInterval(iv);iv=null;}
+    if(_fullEspOn()){ if(opts.espHold)_espBtnHold(opts.espHold,false); }
+    else if(opts.deskUp)sendCmd(opts.deskUp);
+  };
+  el.addEventListener('pointerdown',down);
+  el.addEventListener('pointerup',up);
+  el.addEventListener('pointercancel',up);
+  el.addEventListener('pointerleave',up);
+}
+_bindDual(document.getElementById('bl'),{desk:{type:'mouse_down'},deskUp:{type:'mouse_up'},espHold:1});
+_bindDual(document.getElementById('be'),{desk:{type:'mouse_right_down'},deskUp:{type:'mouse_right_up'},espHold:2});
+_bindDual(document.getElementById('bs'),{desk:{type:'scroll_up'},espWheel:1,repeat:50});
+_bindDual(rr,{desk:{type:'scroll_down'},espWheel:-1,repeat:50});
 ti.addEventListener('focus',function(){
   if(!document.getElementById('sw-spacer')){
     var s=document.createElement('div');s.id='sw-spacer';s.style.cssText='height:400px;flex:0 0 auto;';sw.appendChild(s);
@@ -1766,7 +1990,17 @@ if(localStorage.getItem('deskbeam_theme')==='dark')document.documentElement.clas
 /* ── GYRO page ── */
 document.getElementById('st').addEventListener('click',_openPanel);
 function _gkey(t,cls){var b=document.createElement('button');b.className='gk'+(cls?' '+cls:'');b.textContent=t;return b;}
-function _gTap(b,key){_tapEl(b,function(){sendCmd({type:'key_press',key:key});},true);}
+/* GYRO 页的单次按键类按钮(H/Z/L/M/Q/B/R/E/F/C/X/V/ENTER/SPACE...)。
+   方案 A:GYRO 标题栏的 ESP 开关打开时,这一类改走 ESP32 USB HID;WASD/方向键那些
+   **按住类**仍走 DeskBeam(ESP 的 hid_key 是"按下->50ms->释放",做不了真按住)。
+   布局完全不动 —— 只换按下时的下发路径。
+   ESP 没配置时自动退回 DeskBeam,避免开关打开后按钮全失效。 */
+function _gTap(b,key){
+  _tapEl(b,function(){
+    if(_pg.gyro&&_espRelay)_espHid(key);
+    else sendCmd({type:'key_press',key:key});
+  },true);
+}
 (function(){
   var gl=document.getElementById('gcl'),gr=document.getElementById('gcr');
   function reg(el,side){_gBtns.push({el:el,side:side});}
@@ -1786,16 +2020,34 @@ function _gTap(b,key){_tapEl(b,function(){sendCmd({type:'key_press',key:key});},
   var dnB=_gkey('\u2193','hl');_bindHoldEl(dnB,{type:'key_down',key:'down'},{type:'key_up',key:'down'},true,true);dnB.className+=' dp-down';dirs.appendChild(dnB);
   var rtB=_gkey('\u2192','hl');_bindHoldEl(rtB,{type:'key_down',key:'right'},{type:'key_up',key:'right'},true,true);rtB.className+=' dp-right';dirs.appendChild(rtB);
   reg(dirs,'R');
-  [['H','h',''],['END','end','']].forEach(function(k){var b=_gkey(k[0],k[2]);_gTap(b,k[1]);reg(b,'L');});
-  var fR=_gkey('R','hr');_bindHoldEl(fR,{type:'mouse_right_down'},{type:'mouse_right_up'},true,true);reg(fR,'L');
-  var mB=_gkey('M','blk');_bindHoldEl(mB,{type:'mouse_middle_down'},{type:'mouse_middle_up'},true,true);reg(mB,'L');
+  var hB=_gkey('H','');_gTap(hB,'h');reg(hB,'L');
+  /* END 换成 **CTRL**。Ctrl 是修饰键,必须能**按住**(Ctrl+点击、Ctrl+滚轮、Ctrl+字母),
+     所以用 hold 绑定,和 SHIFT / TAB / SPACE 一致(它们也都是 hold)。
+     走 DeskBeam 的 key_down/key_up -> scancode 0x1D(左 Ctrl),游戏能识别。
+     **不加 ESP 路由**:ESP 的 hid_key 是"一次性按下 50ms 再释放",表达不了"按住 Ctrl"
+     (协议里没有 key_down/key_up);GYRO 的其它修饰键也都走 DeskBeam。 */
+  var ctlB=_gkey('CTRL');
+  _bindHoldEl(ctlB,{type:'key_down',key:'ctrl'},{type:'key_up',key:'ctrl'},true,true);
+  reg(ctlB,'L');
+  /* 字母 E:与"鼠标右键 R"互换,现在落在原本鼠标右键的位置(左列,END 之后) */
+  var eb=_gkey('E','');_gTap(eb,'e');reg(eb,'L');
+  var mB=_gkey('\u4E2D\u952E','blk');_bindHoldEl(mB,{type:'mouse_middle_down'},{type:'mouse_middle_up'},true,true);reg(mB,'L');
   var pu=_gkey('\u25B2');_bindHoldEl(pu,{type:'scroll_up'},null,true);reg(pu,'L');
   var pd=_gkey('\u25BC');_bindHoldEl(pd,{type:'scroll_down'},null,true);reg(pd,'L');
   [['ESC','esc',''],['Z','z','']].forEach(function(k){var b=_gkey(k[0],k[2]);_gTap(b,k[1]);reg(b,'L');});
   [['L','l',''],['M','m',''],['Q','q',''],['B','b','']].forEach(function(k){var b=_gkey(k[0],k[2]);_gTap(b,k[1]);reg(b,'L');});
-  [['R','r',''],['E','e',''],['F','f','']].forEach(function(k){var b=_gkey(k[0],k[2]);_gTap(b,k[1]);reg(b,'R');});
-  var sp=_gkey('SPACE','hl');_gTap(sp,'space');reg(sp,'R');
-  var l=_gkey('CTRL','hl');_bindHoldEl(l,{type:'key_down',key:'ctrl'},{type:'key_up',key:'ctrl'},true,true);reg(l,'R');
+  /* 鼠标左键:按住持续触发(与鼠标右键同款 mouse_down/up)。占用原本"字母 R"的位置。
+     原来的 CTRL 不再保留 —— 用户要求把它换成鼠标左键。 */
+  var lB=_gkey('\u5DE6\u952E','hl');_bindHoldEl(lB,{type:'mouse_down'},{type:'mouse_up'},true,true);reg(lB,'R');
+  /* 鼠标右键:与字母 E 互换,现在落在原本字母 E 的位置(左键之后) */
+  var fR=_gkey('\u53F3\u952E','hr');_bindHoldEl(fR,{type:'mouse_right_down'},{type:'mouse_right_up'},true,true);reg(fR,'R');
+  var fB=_gkey('F','');_gTap(fB,'f');reg(fB,'R');
+  /* SPACE:两种模式都要"按住"语义 ——
+     ESP 关 -> DeskBeam 的 key_down/key_up;
+     ESP 开 -> ESP 版(按下先发一次,然后每 80ms 重发;固件没有真按住) */
+  var sp=_gkey('SPACE','hl');_bindSpaceHold(sp);reg(sp,'R');
+  /* 字母 R:与 CTRL 互换,现在落在原本 CTRL 的位置(SPACE 之后) */
+  var rB=_gkey('R','');_gTap(rB,'r');reg(rB,'R');
   var sh=_gkey('SHIFT');reg(sh,'R');
   _gShRel=_mkShiftBtn(sh);
   [['C','c',''],['X','x','']].forEach(function(k){var b=_gkey(k[0],k[2]);_gTap(b,k[1]);reg(b,'R');});
@@ -1805,9 +2057,11 @@ function _gTap(b,key){_tapEl(b,function(){sendCmd({type:'key_press',key:key});},
   _gLayout();
 })();
 function _gLayout(){
-  if(_gtt===1){sendCmd({type:'mouse_up'});_gtt=0;}
   _gHoldUp.forEach(function(h){
-    if(h.el.classList.contains('pressed')){h.el.classList.remove('pressed');sendCmd(h.up);}
+    /* h.up 是"释放函数"(_bindHoldEl 里的 su),不是命令对象 —— 原来写成
+       sendCmd(h.up) 等于把一个函数当命令发(JSON.stringify 后是 undefined),
+       按住的键因此永远放不掉。这里直接调用。 */
+    if(h.el&&h.el.classList.contains('pressed')){h.el.classList.remove('pressed');try{h.up();}catch(_){}}
   });
   var mc=document.getElementById('gmc'),gl=document.getElementById('gcl'),gr=document.getElementById('gcr');
   if(!mc||!gl||!gr)return;
@@ -1840,75 +2094,124 @@ document.getElementById('gax').addEventListener('click',function(){_gAxSwap=!_gA
   sx.addEventListener('input',function(){_gsX=parseInt(this.value)||20;if(vx)vx.textContent=_gsX;});
   sy.addEventListener('input',function(){_gsY=parseInt(this.value)||20;if(vy)vy.textContent=_gsY;});
 })();
-/* ── GYRO touch canvas: 1-finger left-hold + virtual joystick move ── */
-var _gtt=0; /* 0=none 1=left-down */
+/* 画面**内容**矩形:去掉 object-fit:contain 造成的黑边。
+   `getBoundingClientRect()` 给的是元素盒子 —— 横屏时 #gv 是 width:100%;height:100%
+   加 object-fit:contain,盒子里有黑边,拿盒子换算会把黑边当成画面(实测:点画面底部
+   要点得更低,点开始菜单落到它上方)。竖屏那套 CSS 是 width:auto,盒子=画面,所以
+   竖屏一直是对的。这里按固有宽高比反算内容矩形。 */
+function _contentRect(el){
+  if(!el)return {left:0,top:0,width:0,height:0};
+  var r=el.getBoundingClientRect();
+  var vw=el.videoWidth||el.naturalWidth||(el.tagName==='CANVAS'?el.width:0)||0;
+  var vh=el.videoHeight||el.naturalHeight||(el.tagName==='CANVAS'?el.height:0)||0;
+  if(!vw||!vh||!r.width||!r.height)return r;
+  var ar=vw/vh, box=r.width/r.height;
+  if(ar>box+1e-6){                       /* 画面比盒子宽 -> 上下黑边 */
+    var h=r.width/ar;
+    return {left:r.left, top:r.top+(r.height-h)/2, width:r.width, height:h};
+  }
+  if(ar<box-1e-6){                       /* 画面比盒子高 -> 左右黑边 */
+    var w=r.height*ar;
+    return {left:r.left+(r.width-w)/2, top:r.top, width:w, height:r.height};
+  }
+  return r;
+}
+
+/* ── GYRO 触摸区:与主页同一套手感 + 长按 350ms 自动按住左键 ─────────────
+   * 按下就把光标**绝对定位**到手指那一点(mouse_move_to)
+   * 按住滑动用主页的 _mqAcc 做**相对**移动(4x 灵敏度)
+   * 没滑动就抬起 = **左键单击**;500ms 内二次 = 双击
+   * **按住不动 350ms** = 自动按下左键(mouse_down),此时滑动就是拖拽,抬起释放。
+     这一条是给游戏用的:按住拖动比"先点左键按钮再拖"省一只手。
+   冲突源为零:GYRO 没有双指缩放(_pinching)、没有 Drag 拖拽锁定(_dm),
+   #gta 只属于这一块;而且 GYRO 的鼠标键本来就全走 DeskBeam,长按走同一条路。 */
 (function(){
   var ta=document.getElementById('gta');
   if(!ta)return;
-  var stick=document.getElementById('gstick');
-  var stickKnob=document.getElementById('gstickKnob');
-  var sCX=0,sCY=0,sLx=0,sLy=0,sActive=false,sTouchId=-1;
-  function _stickArea(x,y){
-    if(!stick)return false;
-    var r=stick.getBoundingClientRect();
-    var pad=24;
-    return x>=r.left-pad&&x<=r.right+pad&&y>=r.top-pad&&y<=r.bottom+pad;
+  var tid=-1,px=0,py=0,px0=0,py0=0,moved=false,lastTap=0;
+  var holdT=null, held=false;
+  var HOLD_MS=350;      /* 按住多久算"按住左键" */
+  var HOLD_PX=8;        /* 超过这个位移就不算长按了(手指别抖) */
+
+  /* 触摸坐标 -> 远程像素。用实际可见的那块(视频优先,WebCodecs 时是 canvas)。 */
+  function surface(){
+    var v=document.getElementById('gv'),c=document.getElementById('gc');
+    if(v&&v.style.display!=='none')return v;
+    if(c&&c.style.display!=='none')return c;
+    return null;
   }
+  function moveAbs(t){
+    var s=surface();
+    if(!s||!_rwr||!_rhr||!s.getBoundingClientRect)return;
+    var r=_contentRect(s);            /* **内容**矩形,不是元素盒子(见 _contentRect 注释) */
+    if(!r.width||!r.height)return;
+    /* 摸在画面**外面**(黑边里)就不动光标;摸在画面内但落在最边上,夹进取值范围
+       而不是丢掉 —— 否则画面最底/最右那一条点不到(实测:y=313 换算出 1443 > 1440
+       被整条丢掉)。 */
+    if(t.clientX<r.left||t.clientX>r.left+r.width||t.clientY<r.top||t.clientY>r.top+r.height)return;
+    var x=Math.round((t.clientX-r.left)/r.width*_rwr);
+    var y=Math.round((t.clientY-r.top)/r.height*_rhr);
+    x=Math.max(0,Math.min(_rwr-1,x));
+    y=Math.max(0,Math.min(_rhr-1,y));
+    sendCmd({type:'mouse_move_to',x:x,y:y});
+  }
+  function clearHold(){
+    if(holdT){clearTimeout(holdT);holdT=null;}
+  }
+  function releaseHeld(){
+    if(!held)return;
+    held=false;
+    sendCmd({type:'mouse_up'});
+  }
+
   ta.addEventListener('touchstart',function(e){
-    var ct=e.changedTouches;
-    for(var i=0;i<ct.length;i++){
-      if(_stickArea(ct[i].clientX,ct[i].clientY)){
-        sActive=true;sTouchId=ct[i].identifier;
-        sCX=ct[i].clientX;sCY=ct[i].clientY;
-        sLx=ct[i].clientX;sLy=ct[i].clientY;
-        if(stick)stick.classList.add('active');
-        return;
-      }
-    }
-    var n=e.targetTouches.length-(sActive?1:0);
-    if(n===1&&_gtt===0){sendCmd({type:'mouse_down'});_gtt=1;}
-    else if(n>1&&_gtt===1){sendCmd({type:'mouse_up'});_gtt=0;}
-  },{passive:true});
-  ta.addEventListener('touchmove',function(e){
-    if(sActive){
-      var t;for(var i=0;i<e.touches.length;i++){if(e.touches[i].identifier===sTouchId){t=e.touches[i];break;}}
-      if(t){
-        var ox=t.clientX-sCX,oy=t.clientY-sCY;
-        var d=Math.hypot(ox,oy);
-        if(d>20){ox=ox/d*20;oy=oy/d*20;}
-        var dx=Math.round((t.clientX-sLx)*3);
-        var dy=Math.round((t.clientY-sLy)*3);
-        if(dx>40)dx=40;if(dx<-40)dx=-40;
-        if(dy>40)dy=40;if(dy<-40)dy=-40;
-        sLx=t.clientX;sLy=t.clientY;
-        if(stickKnob)stickKnob.style.transform='translate('+ox+'px,'+oy+'px)';
-        if(dx||dy)sendCmd({type:'mouse_move',dx:dx,dy:dy});
-        return;
-      }
-    }
-    e.preventDefault();
+    /* 触摸区**彻底关掉浏览器的原生长按识别** —— 只加 user-select/contextmenu 还不够,
+       手机仍会有长按振动反馈(实测)。代价是浏览器不再为这块区域合成 click 事件;
+       我们的单击是自己在 touchend 里实现的,不受影响。
+       #tpmsg("点击播放"覆盖层)必须例外:它需要浏览器合成的 click。 */
+    if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))e.preventDefault();
+    if(tid!==-1)return;              /* 已有跟踪中的手指:第二根不劫持、不重启计时 */
+    var t=e.changedTouches[0];
+    tid=t.identifier;
+    px=px0=t.clientX; py=py0=t.clientY;
+    moved=false; held=false;
+    moveAbs(t);
+    clearHold();
+    holdT=setTimeout(function(){
+      holdT=null;
+      if(tid===-1||moved||held)return;   /* 已抬起或已开始拖动 */
+      held=true;
+      sendCmd({type:'mouse_down'});
+    },HOLD_MS);
   },{passive:false});
+
+  ta.addEventListener('touchmove',function(e){
+    e.preventDefault();
+    var t=null;
+    for(var i=0;i<e.touches.length;i++)if(e.touches[i].identifier===tid){t=e.touches[i];break;}
+    if(!t)t=e.changedTouches[0];
+    if(!held&&(Math.abs(t.clientX-px0)>HOLD_PX||Math.abs(t.clientY-py0)>HOLD_PX)){
+      moved=true;                    /* 离起点够远了:这是拖光标,不是长按 */
+      clearHold();
+    }
+    var dx=Math.round((t.clientX-px)*4),dy=Math.round((t.clientY-py)*4);
+    if(Math.abs(dx)<2&&Math.abs(dy)<2)return;
+    px=t.clientX;py=t.clientY;
+    _mqAcc(dx,dy);
+  },{passive:false});
+
   ta.addEventListener('touchend',function(e){
-    for(var i=0;i<e.changedTouches.length;i++){
-      if(e.changedTouches[i].identifier===sTouchId){
-        sActive=false;sTouchId=-1;
-        if(stick)stick.classList.remove('active');
-        if(stickKnob)stickKnob.style.transform='translate(-50%,-50%)';
-        return;
-      }
-    }
-    if(!sActive&&e.targetTouches.length===0){if(_gtt===1)sendCmd({type:'mouse_up'});_gtt=0;}
-  },{passive:true});
-  ta.addEventListener('touchcancel',function(e){
-    for(var i=0;i<e.changedTouches.length;i++){
-      if(e.changedTouches[i].identifier===sTouchId){
-        sActive=false;sTouchId=-1;
-        if(stick)stick.classList.remove('active');
-        if(stickKnob)stickKnob.style.transform='translate(-50%,-50%)';
-        return;
-      }
-    }
-    if(!sActive&&e.targetTouches.length===0){if(_gtt===1)sendCmd({type:'mouse_up'});_gtt=0;}
+    clearHold();
+    tid=-1;
+    if(held){ releaseHeld(); lastTap=0; return; }   /* 长按:只 down+up,不再 click */
+    if(moved)return;
+    if(Date.now()-lastTap<500){sendCmd({type:'mouse_double_click'});lastTap=0;return;}
+    sendCmd({type:'mouse_click'});
+    lastTap=Date.now();
+  },{passive:false});
+
+  ta.addEventListener('touchcancel',function(){
+    clearHold(); tid=-1; releaseHeld();
   },{passive:true});
 })();
 /* ── GYRO input row (text + voice, like main page) ── */
@@ -1921,3 +2224,497 @@ if(grc){
 }
 
 cn();cnV();
+/* ═══════════════════════════════════════════════════════════════════════════
+   按钮行分页:普通 / ESP
+   ─────────────────────────────────────────────────────────────────────────
+   两个行(鼠标 #mc、键盘 #ks)各自有一个页号(_pg.mouse / _pg.keys),点行首那个小方块
+   在两页之间切换,切过去后**整行按钮换成 ESP 版实现**(走 hid_key / hid_mouse 直连
+   ESP32 USB HID,不经过本机 SendInput —— UAC/锁屏/BIOS 下也能用)。
+
+   为什么切换按钮放在滚动容器**外面**:#ks 是 overflow-x:auto 的横向滚动区,放里面
+   的话滑到后半段就够不着了。切换器常驻,滚动的只有按钮。
+
+   ESP 协议能力(实测 components/usb_hid/usb_hid.c 与 relay):
+     hid_key:  "ctrl" / "shift" / "alt" / "win" 用 '+' 拼;单字母 a-z 走算术映射;
+               只有修饰键(如 "win")= 单独按下修饰键;f1..f24、方向键、enter 等齐全
+     hid_mouse: {btn,x,y,w,hold},x/y 是 int8 相对位移,hold=1 按下 / 2 释放
+   ═══════════════════════════════════════════════════════════════════════════ */
+var _pg = { mouse: 0, keys: 0, gyro: 0 };   // 0=普通 1=ESP
+
+/* ESP 是否已配置。没配时:**不允许切到 ESP 页**并给出提示 ——
+   否则按钮看着正常、按下去却毫无反应(_espSend 里 !_espRelay 直接 return)。
+   只强制要求 relayUrl:token 是可选的(relay 侧没设 RELAY_TOKEN 时不需要),
+   device 为空会广播给所有设备,也能用。 */
+function _espConfigured(){ return !!_espRelay; }
+function _espNeedConfig(){
+  alert('未配置 ESP：请在 config.json 里填 esp_relay_url'
+      + '（可选 esp_token / esp_device），然后刷新页面。');
+}
+
+/* ESP 版鼠标行:同样 6 个位置,实现换成 hid_mouse / hid_key */
+var _MOUSE_ESP = [
+  /* L/R 要能**按住**(游戏里按住开火/瞄准)。ESP 协议里对应 hold:1 按下锁存 /
+     hold:2 释放 —— 注意它是**固件里的持久状态**:客户端消失就没人发 hold:2,
+     鼠标会一直按住。所以下面还加了 pagehide / 切页 / 页面隐藏 的释放兜底。 */
+  { t: 'L', espBtnHold: 1 },
+  { t: 'R', espBtnHold: 2 },
+  /* 滚动/退格要能**连续**:按住时每 80ms 重发一次(与 DeskBeam 页的自动重复对齐) */
+  { t: '▲', espRepeat: true, fire: function () { _espMouse({ w: 1 }); } },
+  { t: '▼', espRepeat: true, fire: function () { _espMouse({ w: -1 }); } },
+  { t: '⌫', espRepeat: true, fire: function () { _espHid('backspace'); } },
+  { t: 'Enter', fn: function () { _espHid('enter'); } },
+];
+
+/* ESP 版键盘行 */
+var _KEYS_ESP = [
+  /* 用户要求:切到 ESP 后只保留 drag / 空格 / esc / 方向键,外加 UAC、JS。
+     Ctrl+C 那些固定按钮去掉了 —— 组合器可以自由拼,不用堆按钮。
+     注意:Drag 仍走 DeskBeam(mouse_down/up):ESP 的拖拽要靠 hold 锁存按钮,而**位移
+     来自 DeskBeam 的触摸板**,在 UAC 那种 DeskBeam 输入被挡的场景里它本来也用不了。 */
+  { t: 'Drag', fn: _dragToggle },
+  { t: 'Space', espHold: true, key: 'space' },
+  { t: 'Esc', fn: function () { _espHid('esc'); } },
+  /* UAC / JS 放在方向键**左边**(用户要求:方向键保持在行尾) */
+  { t: 'UAC', fn: _espUac },
+  { t: 'JS', fn: _espJs },
+  { t: '↑', espHold: true, key: 'up' },
+  { t: '↓', espHold: true, key: 'down' },
+  { t: '←', espHold: true, key: 'left' },
+  { t: '→', espHold: true, key: 'right' },
+];
+
+/* 键盘行首的「快捷键组合器」。
+   四个控件:修饰键1、修饰键2(两个弹窗,都含"无")、字母/F 键输入框、✅ 发送。
+   两个弹窗和输入框可以**单独用**:只选 Win 再点 ✅ = 打开开始菜单;只输 f5 = 刷新。
+   状态只在内存里,刷新浏览器才回默认(不写 localStorage)。 */
+var _combo = { m1: '', m2: '', base: '' };
+var _COMBO_MODS = [
+  { v: '', t: '无' }, { v: 'ctrl', t: 'Ctrl' }, { v: 'win', t: 'Win' },
+  { v: 'shift', t: 'Shift' }, { v: 'alt', t: 'Alt' }
+];
+
+function _comboModLabel(v) {
+  /* 未选时**不显示任何字符**(用户要求),按钮靠宽度保持可点 */
+  for (var i = 0; i < _COMBO_MODS.length; i++) if (_COMBO_MODS[i].v === v && v) return _COMBO_MODS[i].t;
+  return '';
+}
+
+/* 输入框只接受 单个字母 或 f1..f24(大小写都行) */
+/* 输入框的词汇表。**两种路径都支持**的才放进来 —— 放了却发不出去比没有更糟。
+   命名键取 ESP 固件键表与 sendinput._VK 的交集:del/insert/tab/caps/esc/enter/
+   space/home/end/pgup/pgdn 两边都有;prtsc/pause 固件没有,所以不收。 */
+var _COMBO_NAMED = {
+  'delete': 'del', 'del': 'del', 'ins': 'insert', 'insert': 'insert',
+  'capslock': 'caps', 'caps': 'caps', 'tab': 'tab', 'esc': 'esc',
+  'enter': 'enter', 'space': 'space', 'home': 'home', 'end': 'end',
+  'pgup': 'pgup', 'pgdn': 'pgdn'
+};
+function _comboNormBase(s) {
+  if (!s) return '';
+  s = s.trim();
+  if (s === '.') return '.';                       // 句号(Ctrl+Alt+. 之类)
+  var low = s.toLowerCase();
+  if (_COMBO_NAMED[low]) return _COMBO_NAMED[low];
+  if (/^[a-z]$/.test(low)) return low;
+  var m = /^f(\d{1,2})$/.exec(low);
+  if (m) { var n = parseInt(m[1], 10); if (n >= 1 && n <= 24) return 'f' + n; }
+  return null;   // null = 非法(face、中文、多字母词一律忽略,不改变已有值)
+}
+
+function _comboSend() {
+  var mods = [];
+  if (_combo.m1) mods.push(_combo.m1);
+  if (_combo.m2 && _combo.m2 !== _combo.m1) mods.push(_combo.m2);
+  var base = _combo.base;
+  if (!mods.length && !base) return;          // 全空:什么也不发
+
+  /* Ctrl+Alt+Del 是 Windows 的"安全注意序列"(SAS):**系统会丢弃任何由程序注入的
+     这个组合**(SendInput 也不例外),所以普通路径下发了也不会生效。ESP 是真 USB HID
+     键盘,由它发就有效 —— 这里直接说清楚,别让人以为按钮坏了。 */
+  if (_pg.keys !== 1 && base === 'del'
+      && mods.indexOf('ctrl') >= 0 && mods.indexOf('alt') >= 0) {
+    alert('Ctrl+Alt+Del 是系统"安全注意序列",程序注入会被 Windows 丢弃。\n'
+        + '这条请切到 ESP 页再发(ESP 是真实 USB 键盘)。');
+    return;
+  }
+
+  if (_pg.keys === 1) {
+    /* ESP 页:一条 hid_key 搞定,固件自己拆 '+'。
+       只有修饰键时(如 "win")固件会单独按下修饰键 -> 开始菜单;重复点多少次发多少次。 */
+    _espHid(mods.concat(base ? [base] : []).join('+'));
+  } else {
+    /* 普通页:按「按下修饰键 -> 按主键 -> 反序放开」下发。
+       不要依赖服务端的命名命令(只有 ctrl_c/ctrl_v/f5… 那几种),组合是无限的;
+       key_down/key_up 协议本来就有。**必须放开修饰键**,否则电脑会卡在 Ctrl 一直按住。 */
+    mods.forEach(function (k) { sendCmd({ type: 'key_down', key: k }); });
+    if (base) sendCmd({ type: 'key_press', key: base });
+    mods.slice().reverse().forEach(function (k) { sendCmd({ type: 'key_up', key: k }); });
+  }
+}
+
+/* 弹个简单菜单选修饰键(含"无") */
+function _comboPick(which, anchor) {
+  var old = document.getElementById('comboMenu');
+  if (old) { old.remove(); return; }        // 再点一次收起
+  var box = document.createElement('div');
+  box.id = 'comboMenu';
+  box.style.cssText = 'position:fixed;z-index:3000;background:var(--surface);border:1px solid var(--border);'
+    + 'border-radius:4px;padding:4px;display:flex;flex-direction:column;gap:2px;'
+    + 'font-family:inherit;font-size:12px;box-shadow:0 4px 12px rgba(0,0,0,.4)';
+  var r = anchor.getBoundingClientRect();
+  box.style.left = Math.round(r.left) + 'px';
+  /* **向上弹**:用 bottom 贴住按钮的顶边。这几个按钮就在屏幕底部,向下弹会看不见。
+     用 bottom 而不是"先量高度再算 top":先量高度那套在真实布局下算错过(实测菜单
+     底边溢出到 611 > vh 485)。max-height 保证再高也不会超出视口。 */
+  box.style.bottom = Math.max(4, Math.round(window.innerHeight - r.top + 4)) + 'px';
+  box.style.maxHeight = '55vh';
+  box.style.overflowY = 'auto';
+  document.body.appendChild(box);
+  _COMBO_MODS.forEach(function (o) {
+    var b = document.createElement('button');
+    b.textContent = o.t;
+    b.style.cssText = 'min-width:76px;height:32px;padding:0 10px;border:1px solid var(--border);'
+      + 'background:transparent;color:' + (_combo[which] === o.v ? 'var(--green)' : 'var(--dim)')
+      + ';font-family:inherit;font-size:12px;cursor:pointer;text-align:left';
+    b.onclick = function () { _combo[which] = o.v; box.remove(); _comboPaint(); };
+    box.appendChild(b);
+  });
+}
+
+/* 把 _combo 的当前值画到三个控件上 */
+function _comboPaint() {
+  var a = document.getElementById('comboM1'), b = document.getElementById('comboM2');
+  if (a) { a.textContent = _comboModLabel(_combo.m1); a.classList.toggle('on', !!_combo.m1); }
+  if (b) { b.textContent = _comboModLabel(_combo.m2); b.classList.toggle('on', !!_combo.m2); }
+}
+
+/* 重排一行之前,必须把「按住的」按键/鼠标松开,否则元素被换掉后 up 事件永远发不出去,
+   电脑会卡在某个键按下的状态。 */
+function _releaseRowHolds() {
+  if (_dm) { _dm = false; sendCmd({ type: 'mouse_up' }); }
+  _espReleaseHolds();     /* ESP 的 hold 锁存在固件里,切页/重排时必须显式放掉 */
+  try {
+    _gHoldUp.forEach(function (h) {
+      /* 同上:h.up 是释放函数,要调用而不是当命令发 */
+      if (h.el && h.el.classList.contains('pressed')) { h.el.classList.remove('pressed'); try { h.up(); } catch (_) { } }
+    });
+  } catch (_) { }
+}
+
+/* 建一个「常驻的行内切换器」:返回在 rowEl 前面的小按钮。
+   rowEl 会被包进一个 flex 容器,切换器在滚动区外面,所以永远够得着。 */
+function _wrapRow(rowEl, key, label) {
+  if (!rowEl || !rowEl.parentNode) return null;
+  var wrap = document.createElement('div');
+  wrap.className = 'row-wrap';
+  rowEl.parentNode.insertBefore(wrap, rowEl);
+  var sw = document.createElement('button');
+  sw.className = 'pg-sw';
+  sw.title = '切换 普通 / ESP';
+  sw.onclick = function () {
+    /* 切到 ESP 页之前先确认配好了,否则提示并保持原页(不切过去) */
+    if (!_pg[key] && !_espConfigured()) { _espNeedConfig(); return; }
+    _releaseRowHolds();
+    _pg[key] = _pg[key] ? 0 : 1;
+    _renderBtnRows();
+  };
+  wrap.appendChild(sw);
+  wrap.appendChild(rowEl);
+  return sw;
+}
+
+/* 按页号重画两个行 + 刷新切换器外观 */
+function _renderBtnRows() {
+  var mc = document.getElementById('mc'), ksc = document.getElementById('ks');
+  if (mc) {
+    mc.innerHTML = '';
+    (_pg.mouse ? _MOUSE_ESP : _MOUSE).forEach(function (s) { mc.appendChild(_mkBtn(s)); });
+    mc.classList.toggle('esp-on', !!_pg.mouse);
+  }
+  if (ksc) {
+    ksc.innerHTML = '';
+    /* 组合器放在最前面,并且 sticky 在左边缘:它属于"行开头",但不会随滚动滑走 */
+    ksc.appendChild(_mkComposer());
+    (_pg.keys ? _KEYS_ESP : _KEYS).forEach(function (s) { ksc.appendChild(_mkBtn(s)); });
+    ksc.classList.toggle('esp-on', !!_pg.keys);
+  }
+  /* ESP 鼠标微调方向盘:只在鼠标行切到 ESP 页时出现 */
+  var pad = document.getElementById('espPad');
+  if (pad) pad.classList.toggle('on', !!_pg.mouse);
+  ['mc-sw', 'ks-sw'].forEach(function (id) {
+    var b = document.getElementById(id);
+    if (!b) return;
+    var on = id === 'mc-sw' ? _pg.mouse : _pg.keys;
+    b.textContent = on ? 'ESP' : '⇄';
+    b.classList.toggle('on', !!on);
+  });
+}
+
+/* 组合器 DOM(每次重画都新建,状态在 _combo 里) */
+function _mkComposer() {
+  var box = document.createElement('div');
+  box.className = 'combo';
+  var a = document.createElement('button');
+  a.id = 'comboM1'; a.className = 'k combo-m';
+  a.onclick = function () { _comboPick('m1', a); };
+  var b = document.createElement('button');
+  b.id = 'comboM2'; b.className = 'k combo-m';
+  b.onclick = function () { _comboPick('m2', b); };
+  var inp = document.createElement('input');
+  inp.id = 'comboKey';
+  inp.className = 'combo-in';
+  inp.type = 'text';
+  inp.placeholder = '';   /* 用户要求:空着不显示提示字符 */
+  inp.maxLength = 6;   /* delete / insert 这类命名键 */
+  inp.autocomplete = 'off';
+  inp.autocapitalize = 'characters';
+  inp.spellcheck = false;
+  inp.value = _combo.base;
+  var ok = document.createElement('button');
+  ok.id = 'comboOk'; ok.className = 'k combo-ok'; ok.textContent = '✓';
+  /* 颜色交给 CSS:.keys.esp-on .combo-ok 才是绿色(普通页保持灰) */
+  var flash = function (txt) {
+    inp.value = txt; inp.classList.add('bad');
+    setTimeout(function () { inp.classList.remove('bad'); inp.value = _combo.base; }, 700);
+  };
+  var commit = function () {
+    var v = _comboNormBase(inp.value);
+    if (v === null) { flash('?'); return; }
+    _combo.base = v; inp.value = v;
+  };
+  inp.addEventListener('input', function () {
+    /* 边输边认:合法就立刻生效(大小写统一成小写),非法先不动 */
+    var v = _comboNormBase(inp.value);
+    if (v !== null) _combo.base = v;
+  });
+  inp.addEventListener('blur', commit);
+  inp.addEventListener('keydown', function (e) { if (e.key === 'Enter') { commit(); _comboSend(); back(); } });
+  /* 和文字输入的 Send 保持一致:发完把输入框失焦、焦点还给触摸板,否则手机上
+     软键盘不会收起、后续点触摸板/按键还得再点一次。 */
+  var back = function () { try { inp.blur(); } catch (_) { } try { ta.focus(); } catch (_) { } };
+  ok.onclick = function () { commit(); _comboSend(); back(); };
+  box.appendChild(a); box.appendChild(b); box.appendChild(inp); box.appendChild(ok);
+  setTimeout(_comboPaint, 0);
+  return box;
+}
+
+/* 统一初始化(必须在文件末尾调用:上面那些 var 赋值不提升) */
+function _initBtnRows() {
+  var mc = document.getElementById('mc'), ksc = document.getElementById('ks');
+  if (mc) { var s1 = _wrapRow(mc, 'mouse'); if (s1) s1.id = 'mc-sw'; }
+  if (ksc) { var s2 = _wrapRow(ksc, 'keys'); if (s2) s2.id = 'ks-sw'; }
+  _renderBtnRows();
+}
+_initBtnRows();
+
+/* ── ESP 的"按住类"键:按下先发一次,然后每 80ms 重发 ──────────────────────
+   固件对 hid_key 的处理是「按下 → 50ms → 释放」,没有真正的按住;ESP 官方网页的做法
+   就是定时重发(参考 esp-macro/server/web/index.html 的 setInterval(...,80))。
+   得到的是系统自动重复(typematic),对方向键/空格这类导航键够用。 */
+function _mkEspHold(spec){
+  var b=document.createElement('button');
+  b.className='k'; b.textContent=spec.t;
+  var iv=null;
+  var stop=function(){
+    if(iv){clearInterval(iv);iv=null;}
+    b.classList.remove('pressed');
+  };
+  var start=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(iv)return;
+    b.classList.add('pressed');
+    _espHid(spec.key);
+    iv=setInterval(function(){_espHid(spec.key);},80);
+  };
+  b.addEventListener('pointerdown',start);
+  b.addEventListener('pointerup',stop);
+  b.addEventListener('pointercancel',stop);
+  b.addEventListener('pointerleave',stop);
+  return b;
+}
+
+/* Drag 开关(普通页与 ESP 页共用) */
+function _dragToggle(){
+  var b=this;
+  _dm=!_dm;
+  b.style.color=_dm?'var(--green)':'';
+  b.style.borderColor=_dm?'var(--green)':'';
+  if(_dm)sendCmd({type:'mouse_down'});else sendCmd({type:'mouse_up'});
+}
+
+/* ── GYRO 标题栏的 ESP 切换(方案 A) ───────────────────────────────────────
+   样式与 GAME / 校准 一致:**无框的 .gyro-g**,放在 .gyro-status-wrap 里 ——
+   那个容器是 display:flex + 子项 flex:1,所以它会和现有按钮**均分标题栏**;
+   作为该容器的最后一个子项,位置正好在 VIDEO 左边。
+   (原来用的是 VIDEO 那套带边框的 gyro-cam-btn,还追加到了标题栏最右边。) */
+(function(){
+  var wrap=document.querySelector('#gyroPage .gyro-status-wrap');
+  if(!wrap)return;
+  var b=document.createElement('span');
+  b.className='gyro-g'; b.id='gesp'; b.textContent='ESP';
+  b.onclick=function(){
+    if(_pg.gyro){ _pg.gyro=0; b.classList.remove('on'); return; }
+    if(!_espConfigured()){ _espNeedConfig(); return; }
+    _pg.gyro=1; b.classList.add('on');
+  };
+  wrap.appendChild(b);
+})();
+
+var _tid0=-1;   /* 触摸板正在跟踪的那根手指的 identifier,见 touchstart */
+
+/* ── GYRO 的 SPACE:按住语义,按当前模式选路径 ────────────────────────────
+   ESP 关 -> DeskBeam 的 key_down/key_up(真实按住);
+   ESP 开 -> ESP 版:按下先发一次 hid_key,随后每 80ms 重发(固件没有真按住,
+             这是 ESP 官方网页同样的做法),松开即停。
+   注册进 _gHoldUp,这样切布局 / 退出 GYRO 时能被释放。 */
+function _bindSpaceHold(el){
+  if(!el)return;
+  var iv=null,pr=false;
+  var espMode=function(){return _pg.gyro&&!!_espRelay;};
+  var start=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(pr)return;pr=true;el.classList.add('pressed');
+    if(espMode()){
+      _espHid('space');
+      iv=setInterval(function(){_espHid('space');},80);
+    }else{
+      sendCmd({type:'key_down',key:'space'});
+    }
+  };
+  var stop=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(!pr)return;pr=false;el.classList.remove('pressed');
+    if(iv){clearInterval(iv);iv=null;}
+    if(!espMode())sendCmd({type:'key_up',key:'space'});
+  };
+  el.addEventListener('pointerdown',start);
+  el.addEventListener('pointerup',stop);
+  el.addEventListener('pointercancel',stop);
+  el.addEventListener('pointerleave',stop);
+  _gHoldUp.push({el:el,up:stop});
+}
+
+/* ── ESP 按住类:重复型 与 鼠标锁存型 ──────────────────────────────────── */
+function _mkEspRepeat(spec){
+  var b=document.createElement('button');
+  b.className='k'; b.textContent=spec.t;
+  var iv=null;
+  var stop=function(){ if(iv){clearInterval(iv);iv=null;} b.classList.remove('pressed'); };
+  var start=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(iv)return;
+    b.classList.add('pressed');
+    spec.fire();
+    iv=setInterval(spec.fire,80);
+  };
+  b.addEventListener('pointerdown',start);
+  b.addEventListener('pointerup',stop);
+  b.addEventListener('pointercancel',stop);
+  b.addEventListener('pointerleave',stop);
+  return b;
+}
+
+/* ESP 鼠标键的"按住":按下发 hold:1(固件锁存),松开发 hold:2。
+   **这是固件里的持久状态** —— 客户端消失就没人释放,所以必须配合兜底:
+   pagehide / 页面隐藏 / 切页 / 重排 时统一 _espReleaseHolds()。 */
+var _espHeldMask=0;
+function _espBtnHold(mask,on){
+  if(on){
+    _espHeldMask|=mask;
+    _espMouse({btn:mask,hold:1});
+  }else{
+    _espHeldMask=0;
+    _espMouse({btn:0,hold:2});
+  }
+}
+function _espReleaseHolds(){
+  if(!_espHeldMask)return;
+  _espHeldMask=0;
+  try{_espMouse({btn:0,hold:2});}catch(_){}
+}
+function _mkEspBtnHold(spec){
+  var b=document.createElement('button');
+  b.className='k'; b.textContent=spec.t;
+  var pr=false;
+  var start=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(pr)return; pr=true; b.classList.add('pressed');
+    _espBtnHold(spec.espBtnHold,true);
+  };
+  var stop=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(!pr)return; pr=false; b.classList.remove('pressed');
+    _espBtnHold(spec.espBtnHold,false);
+  };
+  b.addEventListener('pointerdown',start);
+  b.addEventListener('pointerup',stop);
+  b.addEventListener('pointercancel',stop);
+  b.addEventListener('pointerleave',stop);
+  return b;
+}
+
+/* 兜底:页面被隐藏/卸载时把 ESP 的锁存放掉。
+   手机上 pagehide 不保证执行(系统直接杀进程),所以这只能算 best-effort ——
+   要彻底解决得在 relay 或 ESP 固件上加看门狗(浏览器 WS 断开 / 超时自动 hold:2),
+   那属于 esp-macro 那边的改动。 */
+window.addEventListener('pagehide',_espReleaseHolds);
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState==='hidden')_espReleaseHolds();
+});
+
+/* ── ESP 鼠标微调方向盘(触摸板右下角,仅在 ESP 页显示) ───────────────────
+   步进 15(ESP 协议是 int8,15 在范围内),按住时每 80ms 重发实现连续移动。
+   触摸必须**不穿透**到触摸板:触摸板监听的是 touch 事件,所以除了 pointer 还要
+   停掉 touch 的冒泡,否则点方向键的同时光标也会跟着动。 */
+function _bindEspMove(el, axis, step){
+  if(!el)return;
+  var iv=null;
+  var fire=function(){
+    var m={};
+    if(axis==='x')m.x=step; else m.y=step;
+    _espMouse(m);
+  };
+  var stop=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(!iv)return;
+    clearInterval(iv); iv=null;
+    el.classList.remove('pressed');
+  };
+  var start=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(e&&e.stopPropagation)e.stopPropagation();
+    if(iv)return;
+    el.classList.add('pressed');
+    fire();
+    iv=setInterval(fire,80);
+  };
+  el.addEventListener('pointerdown',start);
+  el.addEventListener('pointerup',stop);
+  el.addEventListener('pointercancel',stop);
+  el.addEventListener('pointerleave',stop);
+  /* 阻止冒泡到 #ta(触摸板),否则会同时拖动光标;**同时 preventDefault** ——
+     只 stopPropagation 的话,事件到不了 #ta 的 preventDefault,浏览器仍会识别
+     成"长按"并给出振动反馈(用户实测)。 */
+  ['touchstart','touchmove','touchend','touchcancel'].forEach(function(t){
+    el.addEventListener(t,function(e){
+      if(e.cancelable)e.preventDefault();
+      e.stopPropagation();
+    },{passive:false});
+  });
+}
+
+(function _initEspPad(){
+  var ta=document.getElementById('ta');
+  if(!ta)return;
+  if(document.getElementById('espPad'))return;
+  var pad=document.createElement('div');
+  pad.id='espPad';
+  [['\u2191','y',-15],['\u2193','y',15],['\u2190','x',-15],['\u2192','x',15]].forEach(function(c){
+    var b=document.createElement('button');
+    b.textContent=c[0];
+    b.setAttribute('aria-label', c[1]==='x'?(c[2]<0?'left':'right'):(c[2]<0?'up':'down'));
+    _bindEspMove(b,c[1],c[2]);
+    pad.appendChild(b);
+  });
+  ta.appendChild(pad);
+})();

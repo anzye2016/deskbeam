@@ -10,11 +10,12 @@
 |---|---|
 | 桌面串流 | 硬件编码（Windows：ddagrab→NVENC/AMF/QSV；Ubuntu X11：x11grab→VAAPI），低延迟、CPU 占用低 |
 | 双传输 | **默认 UDP/RTP**（局域网亦然）：丢包不阻塞后续帧，码率随网络自动升降档；也可手动切回 TCP |
-| 触控板遥控 | 手机屏幕当触摸板，多指缩放（0.5x~10x）、滑动、点击 |
+| 触控板遥控 | 手机屏幕当触摸板，多指缩放（0.5x~10x）、滑动、点击、**按住不动 = 按住左键**（可拖拽） |
 | 快捷键 | 常用快捷键（Ctrl+C/V、Alt+Tab、Win、F5 等），支持多指同时按住 |
 | GYRO 激光笔 | 手机陀螺仪当激光笔，晃动机身移动光标，配翻页键讲 PPT |
 | 声音回传 | UDP 下把电脑声音一并传过来（WASAPI 回环 → Opus），带**自动增益**，不同设备的音量差会自动拉平 |
-| 文字 / 语音 | 输入框打字 → 电脑键盘；按住说话转文字（需自备在线 ASR 接口或本地 WSL 脚本） |
+| 文字 / 语音 | 输入框打字 → 电脑键盘；按住说话转文字：可接**在线接口**，也可接**本地或局域网上的 ASR 服务**（HTTP 接口，模型跑在 WSL / Windows / Docker 都可以，默认本地优先） |
+| ESP-HID 补充 | 配合 [esp-macro](https://github.com/anzye2016/esp-macro) 把 ESP32 当**真正的 USB 键鼠**，用于"合成输入被游戏/反作弊拦截"的场景 |
 | 安全 | TLS 加密 + 口令认证（可选 TOTP 动态码）+ 局域网访问开关 |
 
 ## 三种使用模式
@@ -22,8 +23,8 @@
 点击顶部模式按钮切换：
 
 - **REMOTE**：触控板遥控，无画面，纯控制（带宽极低，手机流量也够用）
-- **SCREEN**：实时桌面串流 + 叠加控制
-- **GYRO**：陀螺仪激光笔 + 快捷键
+- **SCREEN**：实时桌面串流 + 叠加控制（放大到满屏时标题栏保留左右键与滚轮）
+- **GYRO**：陀螺仪激光笔 + 可自定义按键（按住画面 = 按住左键，可拖拽）
 
 ## 快速开始
 
@@ -47,7 +48,13 @@ sudo apt install ffmpeg python3-venv      # 一次性系统依赖（按 GPU 补�
 cd deskbeam && ./start.sh                 # 自动建 venv + 装依赖 + 启动
 ```
 
-**需要 Xorg 会话，Wayland 不支持**（Wayland 设计上禁止全局抓屏）；Ubuntu 默认的 Wayland 需在 `/etc/gdm3/custom.conf` 里设 `WaylandEnable=false` 切到 Xorg。同一份 `config.json`、`certgen.py` 生成证书，浏览器访问 `https://<Linux主机IP>:8770` 即可。
+**需要 Xorg 会话，Wayland 不支持**（Wayland 设计上禁止全局抓屏）；Ubuntu 默认的 Wayland 需在 `/etc/gdm3/custom.conf` 里设 `WaylandEnable=false` 切到 Xorg，或在登录界面右下角的齿轮里选 `Ubuntu on Xorg`。同一份 `config.json`、`certgen.py` 生成证书，浏览器访问 `https://<Linux主机IP>:8770` 即可。
+
+## ESP-HID 补充（可选）
+
+[esp-macro](https://github.com/anzye2016/esp-macro) 是配套项目：ESP32-S3 当 USB 键鼠，并可用继电器做开机/重启。
+
+手机网页通过一个 relay 转发命令，DeskBeam 的页面也能直接用这个通道（设置里填 relay 地址与 token）。它的价值在**真 USB HID** —— 合成输入被游戏或反作弊拦下时，这条路径不受影响。
 
 ## 免 Python 部署（exe）
 
@@ -58,7 +65,7 @@ cd deskbeam && ./start.sh                 # 自动建 venv + 装依赖 + 启动
 点击页面左上角的 LIVE 字样打开操作面板：
 
 - 串流状态：编码方式（硬件 / 软件）与分辨率，可判断串流是否正常或降级
-- 传输方式（UDP / TCP）、声音开关（UDP 下）、详细统计：RTT / 解码 / 上屏 / 缓冲 / 丢帧，UDP 另显示丢包、抖动与 NACK
+- 传输方式（UDP / TCP）、声音开关（UDP 下）、本地/在线语音识别、详细统计：RTT / 解码 / 上屏 / 缓冲 / 丢帧，UDP 另显示丢包、抖动与 NACK
 - Logout 退出登录 · GYRO 切换陀螺仪 · Shutdown 关闭服务 · 主题切换
 
 ## 浏览器要求
@@ -67,7 +74,7 @@ cd deskbeam && ./start.sh                 # 自动建 venv + 装依赖 + 启动
 
 ## 配置
 
-复制 `config.example.json` 为 `config.json` 后按需修改（端口、口令、帧率、码率、传输与声音等）。音频相关参数为 `audio_*` 系列，仅在 UDP 模式下生效。TLS 证书可用 `python certgen.py` 生成。
+复制 `config.example.json` 为 `config.json` 后按需修改（端口、口令、帧率、码率、传输与声音等）。音频相关参数为 `audio_*` 系列，仅在 UDP 模式下生效；语音识别可用 `asr_local_url` 指向本地/局域网的 ASR 服务，或用 `asr_api_*` 接在线接口。TLS 证书可用 `python certgen.py` 生成。
 
 ## 安全
 

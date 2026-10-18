@@ -60,6 +60,14 @@ body.full .bk-mini{display:block;}
 @keyframes rc-pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,80,80,0.4);}50%{box-shadow:0 0 0 8px rgba(255,80,80,0);}}
 .keys{overflow-x:auto;-webkit-overflow-scrolling:touch;white-space:nowrap;display:flex;gap:4px;overscroll-behavior:contain;touch-action:pan-x;}
 body.full .mouse,body.full .input-row,body.full .keys{display:none;}
+/* Full 档位(放大到满屏)时把两个 ESP 切换按钮也藏掉:两行本身已经 display:none,
+   而 #mc-sw/#ks-sw 在 .row-wrap 里(行外面),不显式隐藏的话就剩这两个按钮浮着。 */
+body.full .pg-sw{display:none;}
+/* Full 档只隐藏 RTT(.net-info);fps(#st,也是设置面板入口)**正常显示** ——
+   藏掉 RTT 之后标题栏空间已经够放 L/R/滚轮/缩放/模式了,不必再压 #st。 */
+body.full .net-info{display:none;}
+/* Full 档**不隐藏** ESP 悬浮方向盘:那两行藏了之后它反而是唯一能精确移光标的控件。 */
+body.full #espPad.on{display:grid;}
 body.full{padding:8px 8px 0;gap:6px;}
 body.full #ta{border:none;flex:1;}
 body.full #sw{overflow:hidden!important;display:flex;align-items:center;justify-content:center;}
@@ -104,9 +112,6 @@ body.full #sw canvas,body.full #sw video{width:100%;height:100%;max-width:none!i
 }
 .gyro-page #gsw canvas,.gyro-page #gsw video{max-width:100%;max-height:100%;width:auto;height:auto;object-fit:contain;display:block;margin:auto;}
 .gyro-page #gta{flex:0 0 auto;min-height:25vh;}
-.gyro-stick{position:absolute;right:16px;top:16px;width:88px;height:88px;border-radius:50%;border:2px solid rgba(255,255,255,.35);background:rgba(0,0,0,.25);touch-action:none;z-index:2;}
-.gyro-stick-knob{position:absolute;left:50%;top:50%;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.5);border:2px solid rgba(255,255,255,.7);transform:translate(-50%,-50%);}
-.gyro-stick.active .gyro-stick-knob{background:rgba(120,220,120,.7);}
 @media (orientation:portrait){
   .gyro-page #gta{height:33%;flex:none;}
 }
@@ -131,3 +136,54 @@ body.full #sw canvas,body.full #sw video{width:100%;height:100%;max-width:none!i
 }
 
 
+
+/* ── 按钮行分页(普通/ESP)与快捷键组合器 ─────────────────────────── */
+/* 行外面的 flex 容器:左边是常驻的切换器,右边是原容器(仍保留自己的滚动/网格) */
+.row-wrap{display:flex;gap:4px;align-items:stretch;}
+.row-wrap>.mouse{flex:1;min-width:0;}
+.row-wrap>.keys{flex:1;min-width:0;}
+/* 切换器本身不参与滚动,永远够得着 */
+.pg-sw{flex:0 0 auto;width:34px;height:38px;border:1px solid var(--border);border-radius:4px;
+  background:var(--surface);color:var(--dim);font-family:inherit;font-size:11px;cursor:pointer;padding:0;}
+.pg-sw.on{color:var(--white);background:var(--green);border-color:var(--green);}
+/* ESP 页的按钮换个颜色,避免分不清自己在哪一页 */
+.mouse.esp-on .k,.keys.esp-on .k{border-color:var(--green);}
+/* 组合器:sticky 在滚动区左边缘,属于"行开头"但不会随滚动滑走 */
+.combo{display:flex;gap:3px;align-items:center;flex:0 0 auto;padding-right:4px;
+  border-right:1px solid var(--border);}
+.combo-m{min-width:44px;font-size:11px;}
+.combo-m.on{color:var(--green);border-color:var(--green);}
+.combo-in{width:52px;height:38px;padding:0 4px;border:1px solid var(--border);border-radius:4px;
+  background:var(--surface);color:var(--text);font-family:inherit;font-size:12px;text-align:center;}
+.combo-in.bad{border-color:#e5534b;color:#e5534b;}
+.combo-ok{min-width:36px;font-size:15px;}
+/* ✓ 只在 ESP 页变绿:普通页走 DeskBeam,不该用 ESP 的绿色标识 */
+.keys.esp-on .combo-ok{color:var(--green);border-color:var(--green);}
+
+/* ── ESP 鼠标微调方向盘(触摸板右下角,仅 ESP 页) ─────────────────── */
+.touch{position:relative;}
+#espPad{position:absolute;right:10px;bottom:10px;z-index:6;display:none;
+  grid-template-columns:repeat(2,46px);grid-template-rows:repeat(2,46px);gap:6px;}
+#espPad.on{display:grid;}
+#espPad button{width:46px;height:46px;border:1px solid rgba(255,255,255,.28);border-radius:8px;
+  background:rgba(0,0,0,.42);color:#fff;font-family:inherit;font-size:17px;line-height:1;
+  -webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);
+  touch-action:none;cursor:pointer;padding:0;}
+#espPad button.pressed{background:var(--green);border-color:var(--green);color:var(--white);}
+
+/* ── 触摸区禁止系统长按(选择/上下文菜单/振动反馈) ──────────────────────
+   手指在画面上停 350ms 触发的是**我们自己**的"按住左键";但 Chrome 同时会开始
+   文本选择/上下文菜单,Android 上会伴随一次振动反馈 ✗。user-select:none +
+   touch-callout:none 从根上不让它开始选择;contextmenu 由 app.js 兜一层。
+   覆盖 #ta(主页触摸板)和 #gta(GYRO 触摸区)—— 两者都是 .touch。 */
+.touch,
+.touch canvas,
+.touch video{
+  -webkit-user-select:none;
+  user-select:none;
+  -webkit-touch-callout:none;
+  -webkit-tap-highlight-color:transparent;
+  -webkit-user-drag:none;
+}
+.touch canvas,
+.touch video{ pointer-events:none; }   /* 触摸一律落到 .touch 自己身上,避免视频/画布吃长按手势 */

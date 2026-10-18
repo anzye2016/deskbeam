@@ -1,4 +1,5 @@
 import ctypes
+import time
 from ctypes import wintypes
 
 ULONG_PTR = ctypes.c_size_t
@@ -100,8 +101,23 @@ _VK = {
     "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
     "pgup": 0x21, "pgdn": 0x22, "home": 0x24, "end": 0x23,
     "win": 0x5B, "f5": 0x74, "f12": 0x7B,
+    # f1..f24:VK_F1=0x70 连续排列。原来只有 f5/f12,键盘行组合器的"输入 f 键"会
+    # 对 f1-f4、f6-f11、f13+ 静默失败(服务端 _vk 返回 0,SendInput 什么也不发)。
+    **{f"f{i}": 0x6F + i for i in range(1, 25)},
     "space": 0x20,
     "shift": 0x10, "ctrl": 0x11, "alt": 0x12,
+    # 命名键里原先缺的几个(键盘行组合器会用到)
+    "del": 0x2E, "delete": 0x2E, "ins": 0x2D, "insert": 0x2D,
+    "caps": 0x14, "capslock": 0x14, "menu": 0x5D, "apps": 0x5D,
+    "prtsc": 0x2C, "printscreen": 0x2C, "pause": 0x13,
+}
+
+# 符号 -> VK。**不能靠 ord()**:ord('.')=0x2E 而 0x2E 是 VK_DELETE,句号的 VK 是 0xBE;
+# 逗号/减号/斜杠这些同理。只覆盖单字符键,字母数字仍走 ord(upper)。
+_VK_CHAR = {
+    ".": 0xBE, ",": 0xBC, "-": 0xBD, "=": 0xBB, "/": 0xBF, ";": 0xBA,
+    "'": 0xDE, "[": 0xDB, "]": 0xDD, "\\": 0xDC, "`": 0xC0,
+    " ": 0x20,
 }
 
 _MOD = {
@@ -113,6 +129,10 @@ def _vk(key):
     if vk:
         return vk
     if key and len(key) == 1:
+        # 先查符号表,再退回 ord():字母数字 ord() 恰好等于 VK,符号则不然
+        sym = _VK_CHAR.get(key)
+        if sym:
+            return sym
         return ord(key.upper())
     return 0
 
@@ -134,11 +154,20 @@ def _send_scancode(vk, up=False):
         return
     _send(scan=scan, flags=flags)
 
-def press(key):
+# 单发键的保持时长。零时长会被按帧轮询输入的游戏整帧漏掉(与鼠标点击同一个坑,
+# 见 mouse_click 的注释)。40ms = 60fps 的 2.4 帧 / 30fps 的 1.2 帧。
+# type_text 不走这里,所以不影响打字速度;press 只被 key_press 用。
+KEY_TAP_HOLD_MS = 40
+
+
+def press(key, hold_ms=None):
     vk = _vk(key)
     if not vk:
         return
+    hold = KEY_TAP_HOLD_MS if hold_ms is None else int(hold_ms)
     _send_scancode(vk)
+    if hold > 0:
+        time.sleep(hold / 1000.0)
     _send_scancode(vk, up=True)
 
 def key_down(key):
@@ -168,6 +197,8 @@ def combo(name):
     for m in mod_vks:
         _send_scancode(m)
     _send_scancode(vk)
+    # 主键也必须有保持时长:否则整组组合键在游戏里等于没按下去(见 KEY_TAP_HOLD_MS)
+    time.sleep(KEY_TAP_HOLD_MS / 1000.0)
     _send_scancode(vk, up=True)
     for m in reversed(mod_vks):
         _send_scancode(m, up=True)
@@ -183,6 +214,45 @@ def _virtual_screen():
     h = _GetSystemMetrics(SM_CYVIRTUALSCREEN) or _GetSystemMetrics(SM_CYSCREEN) or 1
     return (_GetSystemMetrics(SM_XVIRTUALSCREEN), _GetSystemMetrics(SM_YVIRTUALSCREEN),
             w, h)
+
+
+# ── 点击类:按下与抬起之间必须有保持时长 ──────────────────────────────────
+# 同一毫秒内 down+up 的话,按帧轮询输入的游戏可能整帧都没看到"按下"状态 ->
+# 单击/双击被吞掉(用户实测:游戏里点画面不认,左键按钮认)。50ms 足够。
+CLICK_HOLD_MS = 50
+DBL_GAP_MS = 40
+
+LEFTDOWN, LEFTUP = 0x0002, 0x0004
+RIGHTDOWN, RIGHTUP = 0x0008, 0x0010
+MIDDLEDOWN, MIDDLEUP = 0x0020, 0x0040
+
+
+def _click(down, up, hold_ms=None):
+    hold = CLICK_HOLD_MS if hold_ms is None else int(hold_ms)
+    mouse_event(down)
+    if hold > 0:
+        time.sleep(hold / 1000.0)
+    mouse_event(up)
+
+
+def mouse_click(hold_ms=None):
+    _click(LEFTDOWN, LEFTUP, hold_ms)
+
+
+def mouse_right_click(hold_ms=None):
+    _click(RIGHTDOWN, RIGHTUP, hold_ms)
+
+
+def mouse_middle_click(hold_ms=None):
+    _click(MIDDLEDOWN, MIDDLEUP, hold_ms)
+
+
+def mouse_double_click(hold_ms=None, gap_ms=None):
+    gap = DBL_GAP_MS if gap_ms is None else int(gap_ms)
+    _click(LEFTDOWN, LEFTUP, hold_ms)
+    if gap > 0:
+        time.sleep(gap / 1000.0)
+    _click(LEFTDOWN, LEFTUP, hold_ms)
 
 
 def mouse_move_to(x, y):

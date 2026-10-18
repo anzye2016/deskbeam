@@ -77,11 +77,28 @@ from websockets.datastructures import Headers
 
 if sys.platform == "win32":
     from sendinput import (press, combo, type_text, mouse_event,
-                           mouse_move_to, key_down, key_up)
+                           mouse_move_to, key_down, key_up,
+                           mouse_click, mouse_right_click, mouse_middle_click,
+                           mouse_double_click)
 else:
     # X11/XTest implementation, same API (docs/DEV-NOTES.md（Linux 移植）)
     from sendinput_linux import (press, combo, type_text, mouse_event,
                                  mouse_move_to, key_down, key_up)
+
+    # 点击要保持时长(见下面 _MOUSE_CMDS 注释);Linux 侧只有一个 mouse_event,
+    # 这里补一层等价实现,保持命令表两个平台一致。
+    def _linux_click(down, up, hold_ms=None):
+        mouse_event(down)
+        time.sleep((50 if hold_ms is None else hold_ms) / 1000.0)
+        mouse_event(up)
+
+    def mouse_click(hold_ms=None):        _linux_click(0x0002, 0x0004, hold_ms)
+    def mouse_right_click(hold_ms=None):  _linux_click(0x0008, 0x0010, hold_ms)
+    def mouse_middle_click(hold_ms=None): _linux_click(0x0020, 0x0040, hold_ms)
+    def mouse_double_click(hold_ms=None, gap_ms=None):
+        _linux_click(0x0002, 0x0004, hold_ms)
+        time.sleep((40 if gap_ms is None else gap_ms) / 1000.0)
+        _linux_click(0x0002, 0x0004, hold_ms)
 
 from platform_api import (get_cursor_pos, set_cursor_pos, screen_size,
                           set_process_priority, is_secure_desktop, is_wayland)
@@ -114,8 +131,10 @@ DEFAULT_CONFIG = {
     "bufsize_lan": "80M",
     "streaming": True,
     "ffmpeg_url": "",
-    "wsl_asr_script": "",
-    "asr_health_url": "",
+    # 本地 ASR:优先走 HTTP API(与平台无关:WSL / Windows 本机 / 局域网 / Docker 都行)
+    "asr_local_enabled": True,     # 本地 ASR 开关(设置卡片里可运行期切换,写回这里)
+    "asr_local_url": "",
+    "asr_local_format": "json",
     "asr_cooldown": 10,
     "asr_api_url": "",
     "asr_api_key": "",
@@ -647,6 +666,39 @@ async def http_handler(connection, request):
         _audit_lan_block(connection.remote_address[0])
         return Response(403, "Forbidden", Headers({}), b"LAN access disabled")
 
+    if path.split("?", 1)[0] == "/asr_local":
+        # 设置卡片里的"本地 ASR"开关:GET 读状态,GET ?on=1|0 改状态。
+        # 状态写回 config.json(重启后保持);关掉后 speech 完全不碰本地,
+        # 但 **asr_local_url 不会被抹掉** —— 重新打开即恢复,不用改配置。
+        if not _check_auth(request):
+            return Response(403, "Forbidden", Headers({}), b"Forbidden")
+        args = {}
+        if "?" in path:
+            for part in path.split("?", 1)[1].split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    args[k] = v
+        words = []
+        if "on" in args:
+            want = args["on"].strip().lower() in ("1", "true", "on", "yes")
+            ip = _real_ip(request.headers, connection.remote_address[0] if connection.remote_address else "")
+            speech.set_local_enabled(want)
+            _cfg["asr_local_enabled"] = want
+            saved = True
+            try:
+                await asyncio.get_running_loop().run_in_executor(executor, _save_config)
+            except Exception:
+                traceback.print_exc()
+                saved = False
+            _audit("ASR LOCAL " + ("on" if want else "off"), ip)
+            words = ["on" if want else "off"] + ([] if saved else ["unsaved"])
+        else:
+            words = ["on" if speech.is_local_enabled() else "off"]
+        return Response(200, "OK", Headers({
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+        }), ":".join(words).encode("utf-8"))
+
     if path.split("?", 1)[0] == "/lan_access":
         # 设置卡片里的运行期开关：GET 读状态，GET ?on=1|0 改状态。改状态会原子
         # 写回 config.json（重启后保持），并立刻断开已连着的局域网会话。
@@ -804,19 +856,61 @@ def _frame_packet(is_idr, seq, data):
 # Simple mouse commands from the frontend -> action. Most map to a fixed
 # MOUSEEVENTF_* flag sequence; scroll entries carry the direction in dy.
 _MOUSE_CMDS = {
-    "mouse_click": lambda: _mouse_flags(0x0002, 0x0004),
-    "mouse_double_click": lambda: _mouse_flags(0x0002, 0x0004, 0x0002, 0x0004),
+    # 点击类走带**保持时长**的版本:down+up 同一毫秒发出时,按帧轮询输入的
+    # 游戏会整帧漏掉"按下"这个状态(实测:游戏点画面不认,左键按钮认)。
+    "mouse_click": mouse_click,
+    "mouse_double_click": mouse_double_click,
     "mouse_down": lambda: _mouse_flags(0x0002),
     "mouse_up": lambda: _mouse_flags(0x0004),
-    "mouse_right": lambda: _mouse_flags(0x0008, 0x0010),
+    "mouse_right": mouse_right_click,
     "mouse_right_down": lambda: _mouse_flags(0x0008),
     "mouse_right_up": lambda: _mouse_flags(0x0010),
-    "mouse_middle": lambda: _mouse_flags(0x0020, 0x0040),
+    "mouse_middle": mouse_middle_click,
     "mouse_middle_down": lambda: _mouse_flags(0x0020),
     "mouse_middle_up": lambda: _mouse_flags(0x0040),
     "scroll_up": lambda: do_mouse("scroll", 0, 1),
     "scroll_down": lambda: do_mouse("scroll", 0, -1),
 }
+
+# 按下类鼠标命令 -> 对应"抬起"命令。断开时要把按下过的补一个抬起,
+# 否则刷新浏览器/断网会让电脑卡在"左键一直按住"。
+_MOUSE_BTN_UP = {
+    "mouse_down": "mouse_up",
+    "mouse_right_down": "mouse_right_up",
+    "mouse_middle_down": "mouse_middle_up",
+}
+_HELD_KEYS = set()      # 当前处于按下状态的键(key_down 过、还没 key_up)
+_HELD_BTNS = set()      # 同上,鼠标键
+
+
+def _release_held():
+    """WS 断开时把按住的键鼠放掉。
+
+    SendInput 注入的 mouse_down / key_down 不会因为客户端走了而自动配对抬起 ——
+    系统根本不知道"客户端"这个概念。所以刷新页面、断网、锁屏之后,电脑可能一直
+    停在"左键按住"或"Ctrl 按住"的状态,只能手动补一次。
+    这里在断线时统一补全;修饰键额外无条件放一次(幂等,代价极低),防止漏记。"""
+    try:
+        for k in list(_HELD_KEYS):
+            try:
+                key_up(k)
+            except Exception:
+                pass
+        _HELD_KEYS.clear()
+        for c in list(_HELD_BTNS):
+            try:
+                _MOUSE_CMDS[_MOUSE_BTN_UP[c]]()
+            except Exception:
+                pass
+        _HELD_BTNS.clear()
+        for k in ("ctrl", "shift", "alt", "win"):
+            try:
+                key_up(k)
+            except Exception:
+                pass
+        print("  released held inputs on disconnect")
+    except Exception as e:
+        print(f"  release held failed: {e}")
 
 
 def _exec_cmd(msg, owner=None):
@@ -854,10 +948,12 @@ def _exec_cmd(msg, owner=None):
             k = msg.get("key", "")
             if k:
                 key_down(k)
+                _HELD_KEYS.add(k)          # 记下来,断开时统一释放
         elif cmd == "key_up":
             k = msg.get("key", "")
             if k:
                 key_up(k)
+                _HELD_KEYS.discard(k)
         elif cmd == "set_gyro":
             global _GYRO_ON, _GVX, _GVY, _gyro_owner
             on = bool(msg.get("on", False))
@@ -882,6 +978,9 @@ def _exec_cmd(msg, owner=None):
         elif cmd == "mouse_move_to":
             x, y = msg.get("x", 0), msg.get("y", 0)
             do_mouse("move_to", x, y)
+        elif cmd in _MOUSE_BTN_UP:          # 记录按下的鼠标键,断开时补一次 up
+            _HELD_BTNS.add(cmd)
+            _MOUSE_CMDS[cmd]()
         elif cmd in _MOUSE_CMDS:
             _MOUSE_CMDS[cmd]()
     except Exception:
@@ -1314,6 +1413,12 @@ async def _start_rtp(sess):
     async with sess.rtp_lock:
         streamer = await _rtp_start_streamer(sess)
     if streamer is None:
+        # 采集建立不起来(**没有活动的显示输出**,或者 DXGI 打开失败):
+        # 告诉客户端,别让它对着一个空白页无限重试还以为是网络问题。
+        try:
+            await sess.ws.send(json.dumps({"type": "screen_no_signal"}))
+        except Exception:
+            pass
         return None
 
     ref = [streamer]
@@ -2039,6 +2144,11 @@ async def ws_handler(websocket):
         pass
     finally:
         _audit("WS DISCONNECT", ip)
+        # 先把按住的键鼠放掉(刷新/断网时 key_up/mouse_up 永远不会到达)
+        try:
+            await asyncio.to_thread(_release_held)
+        except Exception as _e:
+            print(f"  release held error: {_e}")
         sess.running = False
         sender_task.cancel()
         if sess.webrtc:
