@@ -496,7 +496,7 @@ function sm(on){
         // UDP 协商超时兜底:服务端冷启动 RTP(切流让位 ≤2s + 编码器探测 0.5s +
         // first_frame ≤2s + offer)最坏 ~5s,给 8s 余量;超时才回退 TCP。
         if(_rtpTimer){clearTimeout(_rtpTimer);}
-        _rtpTimer=setTimeout(function(){_rtpTimer=null;if(!_rtpMode)_rtpFail();},_NEGO_MS);
+        _rtpTimer=setTimeout(function(){_rtpTimer=null;if(!_rtpMode)_negoTimeout();},_NEGO_MS);
       }
     }
   }else{
@@ -741,7 +741,15 @@ document.addEventListener('visibilitychange',function(){
   }
   if(_recon.cmd){_recon.cmd=false;cn();}
   if(_recon.vid){_recon.vid=false;cnV();}
-  else if(_so)_startScreenVideo();
+  else if(_so){
+    /* 后台时我们发过 screen:false,所以回来必须重新要流。
+       如果回来时已经 >2s 没帧(后台冻结把媒体元素搞成半死)—— 必须**先换一个新
+       的 <video>**,否则重新协商也拿不到画面(实测:只有刷新页面才好)。
+       只重建 PC / 重连 WS 都救不回来。 */
+    var _stale=(!_lastFrameAt)||(performance.now()-_lastFrameAt>2000);
+    if(_stale){ try{console.warn('visible: frames stale -> rebuild <video>');}catch(_){} _rebuildVideoEl(); }
+    _recoverMedia();
+  }
 });
 function cn(){
   var p=location.protocol==='https:'?'wss':'ws';
@@ -1020,7 +1028,9 @@ function _rtpRecv(m){
   }).catch(function(ex){console.error('RTP answer:',ex);_rtpFail();});
 }
 function _rtpFail(){
-  try{console.warn('RTP fail -> fallback (retry='+_rtpRetry+', ws='+(wsV&&wsV.readyState)+')');}catch(_){}
+  var _delay=_recoverBackoff();     /* 连续失败:1/2/4/8/16/30s 退避,别每 14s 撞一次 */
+  try{console.warn('RTP fail -> fallback (retry='+_rtpRetry+', ws='+(wsV&&wsV.readyState)
+    +', streak='+_failStreak+', nextRecover='+Math.round(_delay)+'ms)');}catch(_){}
   _teardownRtp();
   _rtpMode=false;
   /* 只回退不粘死:不再改 _prefManual/RTPPref——一次失败就锁死 TCP 会让
@@ -1315,6 +1325,48 @@ function _setNoSignal(on){
 /* 媒体路径重建:连接与输入通道全部保留,只把视频管线重来一遍。
    画面停了但 socket 还活着时,重连整个会话代价过大(重新协商 + 重新认证 +
    重选传输),还会打断用户正在进行的输入。 */
+/* ── 媒体恢复:A 视频元素重建 / 连续失败退避 / 协商超时诊断 ───────────── */
+var _failStreak=0,_recoverAt=0;
+function _recoverBackoff(){
+  _failStreak++;
+  var delay=Math.min(30000,1000*Math.pow(2,Math.min(5,_failStreak-1)));  /* 1,2,4,8,16,30 */
+  _recoverAt=performance.now()+delay;
+  return delay;
+}
+/* **换一个全新的 <video>**:这是"只有刷新页面才好"的真正原因 —— 后台冻结会把
+   Chrome 的媒体元素搞成半死状态,而重建 PeerConnection / 重连 WS 都救不回来
+   (实测:切标签页后 33fps 变 0、13s 协商超时无限循环,只能刷新)。
+   换元素相当于局部刷新,代价只有一次元素创建。 */
+function _rebuildVideoEl(){
+  ['vd','gv'].forEach(function(id){
+    var old=document.getElementById(id);
+    if(!old||!old.parentNode)return;
+    var nv=document.createElement('video');
+    nv.id=id;
+    nv.muted=true;nv.autoplay=true;nv.playsInline=true;
+    nv.setAttribute('muted','');nv.setAttribute('autoplay','');nv.setAttribute('playsinline','');
+    nv.style.cssText=old.style.cssText;
+    old.parentNode.replaceChild(nv,old);
+    try{ if(_avStream)nv.srcObject=_avStream; _playVid(nv); }catch(_){}
+  });
+  _vidGen++;                      /* 世代守卫:旧 play() 的 promise 作废 */
+}
+/* 13s 协商超时:先打诊断再回退。区分"没收到轨"和"有轨没帧"。 */
+function _negoTimeout(){
+  try{
+    var recv=(_pc&&_pc.getReceivers)?_pc.getReceivers():[];
+    var vd=document.getElementById('vd');
+    console.warn('RTP nego timeout: rtpMode='+_rtpMode
+      +' ice='+(_pc?_pc.iceConnectionState:'-')
+      +' conn='+(_pc?_pc.connectionState:'-')
+      +' recvTracks='+recv.length
+      +' vdSrc='+(vd&&vd.srcObject?'yes':'no')
+      +' vdPaused='+(vd?vd.paused:'-')
+      +' frozen='+(document.hidden?'yes':'no')
+      +' stallStage='+_stallStage+' failStreak='+_failStreak);
+  }catch(_){}
+  _rtpFail();
+}
 function _recoverMedia(){
   try{
     if(_rtpMode){
@@ -1327,7 +1379,7 @@ function _recoverMedia(){
     var fmt=_sendScreenMode();           /* 让服务端重出 offer / 重推流 */
     if(fmt==='rtp'){
       if(_rtpTimer){clearTimeout(_rtpTimer);}
-      _rtpTimer=setTimeout(function(){_rtpTimer=null;if(!_rtpMode)_rtpFail();},_NEGO_MS);
+      _rtpTimer=setTimeout(function(){_rtpTimer=null;if(!_rtpMode)_negoTimeout();},_NEGO_MS);
     }
   }catch(e){console.error('recoverMedia:',e);}
 }
@@ -1335,9 +1387,10 @@ function _frameStall(){
   if(_paused)return;
   if(!_so||!(wsV&&wsV.readyState===WebSocket.OPEN)||!_lastFrameAt)return;
   var now=performance.now();
-  if(now-_lastFrameAt<=5000){_stallStage=0;return;}   /* 有帧:阶段复位 */
+  if(now-_lastFrameAt<=5000){_stallStage=0;_failStreak=0;return;}   /* 有帧:阶段复位 + 清失败计数 */
   if(now<_mediaDeadline)return;   /* 正在协商/重建媒体:这期间无帧是正常的 */
   if(now<=_stallCooldownUntil)return;
+  if(now<_recoverAt)return;        /* 连续失败退避中:别撞得那么勤 */
   _stallCooldownUntil=now+10000;
   _lastFrameAt=now;  /* re-arm: 若仍无帧,10s 后再进下一阶段 */
   if(_stallStage===0){
