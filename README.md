@@ -15,7 +15,7 @@
 | GYRO 激光笔 | 手机陀螺仪当激光笔，晃动机身移动光标，配翻页键讲 PPT |
 | 声音回传 | UDP 下把电脑声音一并传过来（WASAPI 回环 → Opus），带**自动增益**，不同设备的音量差会自动拉平 |
 | 文字 / 语音 | 输入框打字 → 电脑键盘；按住说话转文字：可接**在线接口**，也可接**本地或局域网上的 ASR 服务**（HTTP 接口，模型跑在 WSL / Windows / Docker 都可以，默认本地优先） |
-| ESP-HID 补充 | 配合 [esp-macro](https://github.com/anzye2016/esp-macro) 把 ESP32 当**真正的 USB 键鼠**，用于"合成输入被游戏/反作弊拦截"的场景 |
+| ESP-HID 补充 | 配合 [esp-macro](https://github.com/anzye2016/esp-macro) 把 ESP32 当**真正的 USB 键鼠**：在安全桌面（UAC / 锁屏）、模态菜单等**合成输入失效**的场景下依然可以操作 |
 | 安全 | TLS 加密 + 口令认证（可选 TOTP 动态码）+ 局域网访问开关 |
 
 ## 三种使用模式
@@ -54,7 +54,7 @@ cd deskbeam && ./start.sh                 # 自动建 venv + 装依赖 + 启动
 
 [esp-macro](https://github.com/anzye2016/esp-macro) 是配套项目：ESP32-S3 当 USB 键鼠，并可用继电器做开机/重启。
 
-手机网页通过一个 relay 转发命令，DeskBeam 的页面也能直接用这个通道（设置里填 relay 地址与 token）。它的价值在**真 USB HID** —— 合成输入被游戏或反作弊拦下时，这条路径不受影响。
+手机网页通过一个 relay 转发命令，DeskBeam 的页面也能直接用这个通道（设置里填 relay 地址与 token）。它是**真正的 USB HID 设备**，所以在安全桌面（UAC / 锁屏）、模态菜单这类"合成输入进不去"的场景下依然可以操作。
 
 ## 免 Python 部署（exe）
 
