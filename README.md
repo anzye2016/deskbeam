@@ -48,7 +48,7 @@ sudo apt install ffmpeg python3-venv      # 一次性系统依赖（按 GPU 补�
 cd deskbeam && ./start.sh                 # 自动建 venv + 装依赖 + 启动
 ```
 
-**需要 Xorg 会话，Wayland 不支持**（Wayland 设计上禁止全局抓屏）；Ubuntu 默认的 Wayland 需在 `/etc/gdm3/custom.conf` 里设 `WaylandEnable=false` 切到 Xorg，或在登录界面右下角的齿轮里选 `Ubuntu on Xorg`。同一份 `config.json`、`certgen.py` 生成证书，浏览器访问 `https://<Linux主机IP>:8770` 即可。
+**需要 Xorg 会话，Wayland 不支持**（Wayland 限制全局抓屏）。同一份 `config.json`、`certgen.py` 生成证书，浏览器访问 `https://<Linux主机IP>:8770` 即可。
 
 ## ESP-HID 补充（可选）
 
