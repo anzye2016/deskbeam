@@ -169,6 +169,40 @@ while ($true) {
         # 同一个 —— 属正常现象。launcher 会透传子进程的退出码,退出码仍然有效。
         Log "[deskbeam] DeskBeam started (PID $($p.Id), exe $exe)"
 
+        # 阻塞等进程退出,同时做**健康检查**。
+        #
+        # 为什么需要:实测(tm5 内存测试把系统资源抢光之后)服务会进入"进程活着
+        # 但 8770 不再监听"的半死状态 —— server.log 里的痕迹是
+        #   Task exception was never retrieved
+        #   OSError: [WinError 64] 指定的网络名不再可用。
+        # 即 asyncio 的 accept 协程被打断后再没恢复。$p.WaitForExit() 对这种
+        # 情况完全无感(进程没退出),于是服务一直不可用,只能人工重启。
+        #
+        # 现在:进程活着但端口不在听 -> 杀掉整棵进程树,让下面的退出码分支照常
+        # 重启它。启动后 60s 是宽限期(冷启动 + ffmpeg 探测要几秒),避免误杀;
+        # 查询端口本身失败不当作卡死,下一轮再看。
+        $graceUntil = (Get-Date).AddSeconds(60)
+        while (-not $p.HasExited) {
+            Start-Sleep -Seconds 10
+            if ($p.HasExited) { break }
+            if ((Get-Date) -lt $graceUntil) { continue }
+            # 用 .NET 的监听端点表,不用 Get-NetTCPConnection:CIM 查询实测要
+            # 0.13~0.47s,而这个 0~8ms(快 50~100 倍),每 10s 一次的开销
+            # 从约 0.3% 单核降到约 0.02%(不可测量)。
+            # $alive:$true=在听 / $false=没在听 / $null=查询失败(不判定)
+            $alive = $null
+            try {
+                $eps = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+                $alive = $false
+                foreach ($ep in $eps) { if ($ep.Port -eq $port) { $alive = $true; break } }
+            } catch { $alive = $null }
+            if ($alive -eq $false) {
+                Log "[deskbeam] process alive (PID $($p.Id)) but port $port is not listening -> wedged, restarting"
+                try { taskkill /PID $p.Id /T /F 2>$null } catch {}
+                Start-Sleep -Seconds 2
+                break
+            }
+        }
         $p.WaitForExit()
         $code = $p.ExitCode
         $lived = (Get-Date) - $started
