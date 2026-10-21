@@ -1308,6 +1308,10 @@ class _VideoSession:
         self.webrtc = None
         self.rtp = None
         self.rtp_pending = False
+        # 安全桌面(UAC/锁屏)状态。由 _gpu_sender 里的 _secure_watch 维护,给
+        # _rtp_capture_loop 用 —— 两个函数在不同作用域(secure_last 是局部变量,
+        # 跨不过去),所以状态必须挂在 sess 上。
+        self.secure_paused = False
         self.rtp_ref = None
         # 非 RTP 路径当前占用的 GPUStreamer,由 _gpu_sender 维护。set_mode 切
         # RTP 时先等它让位(见 ws_handler),避免两套 ffmpeg 并抢 NVENC/DXGI。
@@ -1562,6 +1566,51 @@ async def _rtp_keyframe_loop(sess, transport):
             break
         _gpu_dbg("RTP keyframe request -> restarting encoder")
         await _rtp_restart_streamer(sess)
+
+
+# RTP 路径的**采集看门狗**。
+#
+# 为什么需要(2026-10-21 实测,两台机器都复现):切到安全桌面(UAC 同意框/锁屏)时
+# ddagrab 被拒、ffmpeg 直接退出。`_gpu_sender()` 里有 secure_last + alive() 的完整
+# 处理,但 **RTP 走的是另一条 sender**,原来只由 `_rtp_bitrate_loop`(丢包)和
+# `_rtp_keyframe_loop`(PLI)触发重建 —— 安全桌面这两者都不会触发。于是 UAC 关掉、
+# 客户端收到 screen_resumed 之后,**没有任何人重启采集**,画面停在最后一帧,只能等
+# 客户端自己 5s 的停滞看门狗(`_frameStall`)重连。实测恢复要 5~10s,表现为
+# "UAC 提示正常出现,但关掉后画面半天不刷新"。
+#
+# 现在每秒检查一次 streamer 是否还活着:死了就原地重建(约 0.5~2s 出首帧 IDR)。
+# 安全桌面期间不尝试(必然失败,只会刷日志);连续失败按 1→2→4→8s 退避。
+_RTP_CAP_INTERVAL = 1.0
+_RTP_CAP_BACKOFF_MAX = 8.0
+
+
+async def _rtp_capture_loop(sess):
+    backoff = _RTP_CAP_INTERVAL
+    while sess.running and sess.rtp:
+        await asyncio.sleep(backoff)
+        if not sess.rtp:
+            return
+        if getattr(sess, "secure_paused", False):
+            # 安全桌面:重启用不了,别连着试
+            backoff = _RTP_CAP_INTERVAL
+            continue
+        ref = getattr(sess, "rtp_ref", None)
+        s = ref[0] if ref else None
+        if s is None:
+            continue
+        try:
+            alive = s.alive()
+        except Exception:
+            alive = True            # 查询失败不当作死亡,下一轮再看
+        if alive:
+            backoff = _RTP_CAP_INTERVAL
+            continue
+        _gpu_dbg("rtp capture died (secure desktop left?) -> restarting streamer")
+        try:
+            await _rtp_restart_streamer(sess)
+        except Exception as e:
+            _gpu_dbg(f"rtp capture restart failed: {e!r}")
+        backoff = min(_RTP_CAP_BACKOFF_MAX, backoff * 2)
 
 
 async def _rtp_bitrate_loop(sess, transport):
@@ -1891,6 +1940,7 @@ async def _gpu_sender(sess):
                     secure = False
                 if secure != secure_last:
                     secure_last = secure
+                    sess.secure_paused = secure
                     _gpu_dbg("secure desktop: " + ("entered" if secure else "left"))
                     try:
                         await sess.ws.send(json.dumps({
@@ -2130,6 +2180,10 @@ async def ws_handler(websocket):
                         _ktask = asyncio.create_task(_rtp_keyframe_loop(sess, transport))
                         _BACKGROUND_TASKS.add(_ktask)
                         _ktask.add_done_callback(_BACKGROUND_TASKS.discard)
+                        # 采集看门狗:安全桌面回来后主动重启采集(见 _rtp_capture_loop)
+                        _ctask = asyncio.create_task(_rtp_capture_loop(sess))
+                        _BACKGROUND_TASKS.add(_ctask)
+                        _ctask.add_done_callback(_BACKGROUND_TASKS.discard)
             elif cmd == "rtp_answer":
                 if sess.rtp:
                     await sess.rtp.handle_answer(msg["sdp"], msg.get("sdp_type", "answer"))
