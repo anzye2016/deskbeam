@@ -101,7 +101,8 @@ else:
         _linux_click(0x0002, 0x0004, hold_ms)
 
 from platform_api import (get_cursor_pos, set_cursor_pos, screen_size,
-                          set_process_priority, is_secure_desktop, is_wayland)
+                          set_process_priority, is_secure_desktop, is_wayland,
+                          read_clipboard_text)
 
 # ── Config ──
 if getattr(sys, "frozen", False):
@@ -1120,6 +1121,16 @@ async def ws_cmd_handler(websocket):
                             _task = asyncio.create_task(_transcribe_full(wav_path))
                             _BACKGROUND_TASKS.add(_task)
                             _task.add_done_callback(_BACKGROUND_TASKS.discard)
+                    continue
+                if msg.get("type") == "get_clipboard":
+                    # 手动按按钮才会走到这里:只读一次,不轮询。只回纯文本,
+                    # 复制的是文件/图片等一律回空(客户端什么都不做)。
+                    try:
+                        text, why = await asyncio.to_thread(read_clipboard_text)
+                    except Exception as e:
+                        text, why = "", f"读取失败: {e}"
+                    await websocket.send(json.dumps({
+                        "type": "clipboard", "text": text, "why": why}))
                     continue
                 if msg.get("type") == "ping":
                     await websocket.send(json.dumps({"type": "pong", "t": msg.get("t")}))

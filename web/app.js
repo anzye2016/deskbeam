@@ -27,6 +27,23 @@ function _mkShiftBtn(sh){
   return rel;
 }
 var ks=document.getElementById('ks');
+/* 手动读取电脑剪贴板(一次):只读纯文本;复制的是文件时服务端回空,客户端不动。
+   回包的文本会**覆盖**输入框(不是追加),见下方 cn() 的 clipboard 分支。 */
+function _pullClipboard(){ sendCmd({type:'get_clipboard'}); }
+/* 把焦点交回当前页的触摸区。按钮的 touchend 有 preventDefault(防误触),浏览器
+   不会自动把焦点从输入框挪走,所以显式做。
+   **必须延后到手势结束**:在 touchstart 里同步失焦会让软键盘在手势中途收起,
+   布局回落错位(实测:输入框掉到原位以下、键盘行被挤出屏幕)。 */
+function _focusTouch(){
+  var id = (typeof _gm!=='undefined' && _gm && document.getElementById('gta')) ? 'gta' : 'ta';
+  setTimeout(function(){
+    var el = document.getElementById(id);
+    if(!el) return;
+    try{ el.focus({preventScroll:true}); }catch(_){ try{ el.focus(); }catch(__){} }
+    try{ if(window.scrollY) window.scrollTo(0,0); }catch(_){}
+    try{ document.documentElement.scrollTop = 0; }catch(_){}
+  }, 0);
+}
 function _mkBtn(spec){
   if(spec.espHold)return _mkEspHold(spec);      /* ESP:按住时重发 hid_key(方向键/空格) */
   if(spec.espRepeat)return _mkEspRepeat(spec);  /* ESP:按住时重发任意动作(滚动/退格) */
@@ -53,6 +70,8 @@ var _KEYS=[
      断线时服务端 _release_held 会补 key_up,不会卡住。 */
   {t:'Space',m:'hold',d:{type:'key_down',key:'space'},u:{type:'key_up',key:'space'},nr:true},
   {t:'Esc',c:'esc'},
+  /* 手动读一次电脑剪贴板(纯文本),覆盖输入框。放在**方向键左侧**(用户要求)。 */
+  {t:'CLIP',fn:_pullClipboard},
   {t:'↑',m:'hold',d:{type:'key_down',key:'up'},u:{type:'key_up',key:'up'},nr:true,nc:true},
   {t:'↓',m:'hold',d:{type:'key_down',key:'down'},u:{type:'key_up',key:'down'},nr:true,nc:true},
   {t:'←',m:'hold',d:{type:'key_down',key:'left'},u:{type:'key_up',key:'left'},nr:true,nc:true},
@@ -778,6 +797,16 @@ function cn(){
         if(m.espConfig){
           _espRelay=m.espConfig.relayUrl;_espToken=m.espConfig.token;_espDev=m.espConfig.device;_espLockPw=m.espConfig.lockPassword||'';_espLockEnter=m.espConfig.lockEnter===true;
         }
+      }else if(m.type==='clipboard'){
+        /* 服务端手动读取的结果。有 text 才填:**覆盖**而不是追加;
+           复制的是文件/非文本时 text 为空,这里什么都不做。 */
+        var tx=(typeof m.text==='string')?m.text:'';
+        if(tx){
+          var el=document.getElementById('ti');
+          if(el){el.value=tx;try{el.dispatchEvent(new Event('input'));}catch(_){}}
+          var g2=document.getElementById('gti');
+          if(g2){g2.value=tx;}
+        }
       }else if(m.type==='pong'){
         if(typeof m.t==='number'){
           var _s=performance.now()-m.t;
@@ -1502,6 +1531,8 @@ ta.addEventListener('touchstart',function(e){
      我们的单击是自己在 touchend 里实现的,不受影响。
      #tpmsg("点击播放"覆盖层)必须例外:它需要浏览器合成的 click。 */
   if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))e.preventDefault();
+  /* 焦点在 touchend(下方)里交还 —— 这里不能做:手势中途收软键盘会让视口重排,
+     布局跳变、且长按的 mouse_down 来不及释放(实测能拖选文字)。 */
   if(_tt){clearTimeout(_tt);_tt=null;}
   _pinchEnded=false;
   if(_pinching)return;                       /* 手势进行中：忽略新增触点，避免重算锚点 */
@@ -1554,6 +1585,7 @@ ta.addEventListener('touchmove',function(e){
   _mqAcc(dx,dy);
 },{passive:false});
 ta.addEventListener('touchend',function(e){
+  _focusTouch();          /* 手势已结束:此时收键盘不会打乱布局/长按释放 */
   _hClear();
   if(_hHeld){ _hRelease(); _te=Date.now(); _lt=0; return; }   /* 长按:只 down+up,不 click */
   if(_pinching){
@@ -1882,12 +1914,17 @@ function _bindHoldEl(el,dcmd,ucmd,nocancel,norepeat){
   };
   var up=function(e){
     if(e.type==='touchend'&&sl)return;
-    e.preventDefault();sTid=-1;rem();
-    if(!pr)return;pr=false;
+    e.preventDefault();sTid=-1;
+    if(!pr){rem();return;}
+    pr=false;
     if(pend){clearTimeout(pend);pend=null;fireDown();}   /* 快速点击:补发一次按下 */
     if(to){clearTimeout(to);to=null;}
     if(iv){clearInterval(iv);iv=null;}
     fired=false; su();
+    /* **rem() 必须放在最后** —— fireDown() 里会 add(),先 rem 再 fireDown 会让
+       .pressed 永久留在按钮上(实测:方向键按下变黑不还原)。 */
+    rem();
+    _focusTouch();          /* 按过按住型按钮后,焦点还给触摸板 */
   };
   _gHoldUp.push({el:el,up:su});
   if(!_isTouch){el.addEventListener('mousedown',down);el.addEventListener('mouseup',up);el.addEventListener('mouseleave',up);}
@@ -1907,7 +1944,7 @@ function _tapEl(el,fn,nocancel){if(!el)return;
       var t=e.changedTouches[0];sx=t.clientX;sy=t.clientY;sTid=t.identifier;sl=false;add();return;
     }
     if(sl){rem();return;}
-    e.preventDefault();rem();fn.call(el);
+    e.preventDefault();rem();fn.call(el);_focusTouch();
   };
   var mv=function(e){
     if(sl)return;
@@ -1922,7 +1959,11 @@ function _tapEl(el,fn,nocancel){if(!el)return;
   el.addEventListener('touchend',f,{passive:false});
 }
 var sn=document.getElementById('sn'),rc=document.getElementById('rc'),rr=document.getElementById('rr');
-sn.addEventListener('click',function(){var t=ti.value;if(!t)return;sendCmd({type:'type_text',text:t.replace(/\n/g,' ')});ti.value='';ta.focus();});
+sn.addEventListener('click',function(){
+  var t=ti.value;
+  if(!t){ _focusTouch(); return; }          /* 空输入也把焦点还给触摸板 */
+  sendCmd({type:'type_text',text:t.replace(/\n/g,' ')});ti.value='';_focusTouch();
+});
 var _rr=false,_ac=null,_st=null,_ch=[];var _te=0,_ci=null;
 var _pxc=null,_pxb=false;
 var _awUrl=URL.createObjectURL(new Blob(
@@ -2223,6 +2264,7 @@ function _contentRect(el){
        我们的单击是自己在 touchend 里实现的,不受影响。
        #tpmsg("点击播放"覆盖层)必须例外:它需要浏览器合成的 click。 */
     if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))e.preventDefault();
+    /* 焦点在 GYRO 的 touchend 里交还(手势结束后) */
     if(tid!==-1)return;              /* 已有跟踪中的手指:第二根不劫持、不重启计时 */
     var t=e.changedTouches[0];
     tid=t.identifier;
@@ -2254,6 +2296,7 @@ function _contentRect(el){
   },{passive:false});
 
   ta.addEventListener('touchend',function(e){
+    _focusTouch();        /* 手势结束后再交还焦点,避免中途收键盘 */
     clearHold();
     tid=-1;
     if(held){ releaseHeld(); lastTap=0; return; }   /* 长按:只 down+up,不再 click */
@@ -2330,6 +2373,8 @@ var _KEYS_ESP = [
   /* UAC / JS 放在方向键**左边**(用户要求:方向键保持在行尾) */
   { t: 'UAC', fn: _espUac },
   { t: 'JS', fn: _espJs },
+  /* 手动读一次电脑剪贴板(走 DeskBeam 的 ws_cmd,与 ESP 通道无关)。放在方向键左侧 */
+  { t: 'CLIP', fn: _pullClipboard },
   { t: '↑', espHold: true, key: 'up' },
   { t: '↓', espHold: true, key: 'down' },
   { t: '←', espHold: true, key: 'left' },
@@ -2762,10 +2807,15 @@ function _bindEspMove(el, axis, step){
   if(document.getElementById('espPad'))return;
   var pad=document.createElement('div');
   pad.id='espPad';
-  [['\u2191','y',-15],['\u2193','y',15],['\u2190','x',-15],['\u2192','x',15]].forEach(function(c){
+  /* "山"字型(用户要求):第一行只有 ↑,第二行 ← ↓ →,且 ↑ 正在 ↓ 正上方。
+     用显式 grid 定位,不依赖 DOM 顺序,以后加键也不会错位。 */
+  [['\u2191','y',-15,2,1],['\u2190','x',-15,1,2],['\u2193','y',15,2,2],['\u2192','x',15,3,2]]
+  .forEach(function(c){
     var b=document.createElement('button');
     b.textContent=c[0];
     b.setAttribute('aria-label', c[1]==='x'?(c[2]<0?'left':'right'):(c[2]<0?'up':'down'));
+    b.style.gridColumn=String(c[3]);
+    b.style.gridRow=String(c[4]);
     _bindEspMove(b,c[1],c[2]);
     pad.appendChild(b);
   });

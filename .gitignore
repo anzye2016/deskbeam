@@ -24,3 +24,9 @@ frp/frpc.exe
 ffmpeg/
 config.json.bak*
 *.bak-*
+
+# 测试用 Chrome 临时配置目录(CDP harness 产生)
+dbclip*/
+
+# gpu_stream 的调试日志(运行时生成)
+gpu_stream_debug.txt

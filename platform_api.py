@@ -193,3 +193,61 @@ else:
         # X11 has no secure-desktop switch to report; capture loss there is
         # just a normal stall.
         return False
+
+
+# ── 剪贴板（手动读取，一次）──────────────────────────────────────────────
+# 只读**纯文本**。必须先判 CF_HDROP：Windows 复制文件时也会把文件名放进
+# CF_UNICODETEXT，先读文本就会把"文件路径"当成文本发出去。
+def read_clipboard_text(max_chars=10000):
+    """Return (text, why). Windows only; files / 非文本 -> ("", 原因)。"""
+    if not _IS_WIN:
+        return "", "仅 Windows 支持"
+    import ctypes
+    import time as _t
+    from ctypes import wintypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.OpenClipboard.argtypes = [wintypes.HWND]
+    u32.OpenClipboard.restype = wintypes.BOOL
+    u32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+    u32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+    u32.GetClipboardData.argtypes = [wintypes.UINT]
+    u32.GetClipboardData.restype = wintypes.HANDLE
+    u32.CloseClipboard.argtypes = []
+    u32.CloseClipboard.restype = wintypes.BOOL
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalLock.restype = wintypes.LPVOID
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalUnlock.restype = wintypes.BOOL
+
+    CF_UNICODETEXT, CF_HDROP = 13, 15
+    opened = False
+    for _ in range(10):                  # 剪贴板常被别的程序短暂占用
+        if u32.OpenClipboard(None):
+            opened = True
+            break
+        _t.sleep(0.05)
+    if not opened:
+        return "", "剪贴板被占用"
+    try:
+        if u32.IsClipboardFormatAvailable(CF_HDROP):
+            return "", "复制的是文件，不处理"
+        if not u32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            return "", "剪贴板里没有文本"
+        h = u32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return "", "读取失败"
+        p = k32.GlobalLock(h)
+        if not p:
+            return "", "锁定失败"
+        try:
+            text = ctypes.wstring_at(p) or ""
+        finally:
+            k32.GlobalUnlock(h)
+        if not text:
+            return "", "剪贴板是空的"
+        if len(text) > max_chars:
+            return text[:max_chars], "已截断到 %d 字符" % max_chars
+        return text, ""
+    finally:
+        u32.CloseClipboard()
