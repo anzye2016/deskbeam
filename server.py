@@ -1493,6 +1493,11 @@ async def _start_rtp(sess):
     # 否则 set_mode 的冷启动会和 bitrate/keyframe 循环触发的重建并发抢 NVENC/DXGI。
     async with sess.rtp_lock:
         streamer = await _rtp_start_streamer(sess)
+        if streamer is not None:
+            # 从这里到 transport 建好之间任何异常都会让 streamer 变成孤儿，
+            # 而孤儿握着 ddagrab 会让**之后所有**采集都失败。先把引用挂到
+            # sess.rtp_ref 上，外层清理路径才有机会关掉它。
+            sess.rtp_ref = [streamer]
     if streamer is None:
         # 采集建立不起来(**没有活动的显示输出**,或者 DXGI 打开失败):
         # 告诉客户端,别让它对着一个空白页无限重试还以为是网络问题。
@@ -1573,15 +1578,22 @@ async def _rtp_restart_streamer(sess):
     # 档位已经变了(sess._bitrate_tier 由调用方先更新),把 pacer 目标对齐过去。
     _rtp_sync_pacer(sess)
     async with sess.rtp_lock:
-        new_s = await _rtp_start_streamer(sess)
-        if new_s is None:
-            return
-        old, ref[0] = ref[0], new_s
-        _gpu_dbg(f"RTP restart streamer (tier {sess._bitrate_tier})")
+        # **先关旧的、再建新的**：ddagrab(桌面复制)同一时间只允许一个占用者。
+        # 原来先建新的、失败就直接 return，旧的永远不关 —— 于是新 streamer 必然
+        # "Device or resource busy"，每次重试再留一个孤儿，最后全员失败、只能重启
+        # 服务(实测 4 个孤儿把自己锁死)。
+        old = ref[0]
         try:
             old.close()
         except Exception:
             pass
+        ref[0] = None
+        new_s = await _rtp_start_streamer(sess)
+        if new_s is None:
+            _gpu_dbg("RTP restart: new streamer failed (ddagrab busy?) -> old already closed")
+            return
+        ref[0] = new_s
+        _gpu_dbg(f"RTP restart streamer (tier {sess._bitrate_tier})")
 
 
 _RTP_KEY_COOLDOWN = 1.5  # 两次按需关键帧之间的最小间隔(秒)
@@ -2350,8 +2362,38 @@ def _ensure_firewall():
         print(f"  firewall: skipped ({e!r})")
 
 
+def _sweep_stray_ffmpeg():
+    """清掉上次运行遗留的、命令行含 ddagrab 的 ffmpeg。
+
+    ddagrab(桌面复制)同一时间只允许一个占用者。一个残留进程就让**所有**新采集
+    报 "Device or resource busy"，进而 "no usable H.264 encoder"，画面彻底没有，
+    而且每次重试还会再留一个孤儿(实测 4 个把自己锁死，只能手动 taskkill)。
+    启动时清一次，把这类事故挡在门口。只杀命令行含 ddagrab 的，不碰别人的 ffmpeg。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import subprocess as _sp
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='ffmpeg.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*ddagrab*' } | "
+              "ForEach-Object { $_.ProcessId }")
+        out = _sp.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                      capture_output=True, text=True, timeout=20).stdout
+        killed = 0
+        for tok in out.split():
+            if not tok.isdigit():
+                continue
+            _sp.run(["taskkill", "/PID", tok, "/F"], capture_output=True, timeout=10)
+            killed += 1
+        if killed:
+            print(f"  swept {killed} stray ffmpeg process(es) holding ddagrab")
+    except Exception as e:
+        print(f"  stray ffmpeg sweep failed: {e!r}")
+
+
 async def main():
     _ensure_firewall()
+    _sweep_stray_ffmpeg()
     global _CERT_FINGERPRINT
     set_process_priority()
 
