@@ -639,30 +639,28 @@ th.textContent=document.documentElement.classList.contains('dark')?'DARK':'LIGHT
      关闭后来自 RFC1918 的连接一律 403，已连着的局域网会话会被立刻断开——若
      本机正在走局域网，关它会连自己一起断。 */
   var la=document.createElement('button');
-  la.style.cssText='height:36px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer';
-  la.textContent='LAN ACCESS: ...';la.disabled=true;
+  la.style.cssText='flex:1;height:36px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer';
+  la.textContent='LAN ...';la.disabled=true;
   var _laOn=null;
   function _laPaint(t){
     _laOn=(t==='on');
-    la.textContent='LAN ACCESS: '+(_laOn?'ON':'OFF');
+    la.textContent='LAN '+(_laOn?'ON':'OFF');
     la.style.borderColor=_laOn?'var(--green)':'var(--accent)';
     la.style.color=_laOn?'var(--green)':'var(--accent)';
     la.disabled=false;
   }
   fetch(_BASE+'/lan_access',{credentials:'include',cache:'no-store'}).then(function(r){return r.ok?r.text():null;})
-    .then(function(t){if(t===null){la.textContent='LAN ACCESS: --';return;}_laPaint(t.trim().split(':')[0]);})
-    .catch(function(){la.textContent='LAN ACCESS: --';});
+    .then(function(t){if(t===null){la.textContent='LAN --';return;}_laPaint(t.trim().split(':')[0]);})
+    .catch(function(){la.textContent='LAN --';});
   la.onclick=function(){
     if(_laOn===null)return;
     var want=!_laOn;la.disabled=true;
     fetch(_BASE+'/lan_access?on='+(want?'1':'0'),{credentials:'include',cache:'no-store'})
       .then(function(r){return r.ok?r.text():null;})
       .then(function(t){
-        if(t===null){la.textContent='LAN ACCESS: --';return;}
+        if(t===null){la.textContent='LAN --';return;}
         var p=t.trim().split(':');
         _laPaint(p[0]);
-        if(p[1]==='unsaved')la.textContent+=' (未写入 config)';
-        else if(!_laOn&&_isLan)la.textContent+=' (本机已断开)';
       })
       .catch(function(){la.disabled=false;});
   };
@@ -698,7 +696,96 @@ th.textContent=document.documentElement.classList.contains('dark')?'DARK':'LIGHT
   dg.style.cssText='flex:1;height:36px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer';
   dg.onclick=function(){d.remove();_diagToggle();};
   rowT.appendChild(dg);
-  b.appendChild(la);
+  /* 分辨率 + 帧率：**自定义下拉**（原生 <select> 里放不了输入框）。
+     每一行 = 分辨率 + 自己的帧率输入框：
+       * 留空        → 只改分辨率
+       * 填了        → 分辨率 + 帧率一起改（两个一起生效，不会互相打架）
+       * 只改帧率    → 在**当前分辨率那一行**填帧率，再点这一行（分辨率不变）
+       * 确认框总是显示帧率：填了用填的，没填用当前（原始）帧率
+     写哪一对键(wan_* / lan_*)由**服务端**按请求来源判定，客户端不参与 ——
+     客户端以为的 LAN/WAN 可能和服务端不一致（Tailscale 被服务端算作 WAN）。
+     改完服务端落盘并关监听，和 Shutdown 按钮**同一条路径**（守护进程拉起）。 */
+  var RES_OPTS=[['原始',0,0],['720P',1280,720],['1080P',1920,1080],['2K',2560,1440]];
+  var _curWH='',_curFps='',_resBusy=false,_rows=[];
+  var _inpSt='width:56px;flex:none;height:30px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;text-align:center;padding:0 4px;box-sizing:border-box';
+  var resBtn=document.createElement('button');
+  resBtn.textContent='-- ▾';
+  resBtn.title='分辨率 / 帧率（改完服务会重启一次）';
+  resBtn.style.cssText='flex:1;height:36px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer;text-align:center';
+  var resPop=document.createElement('div');
+  resPop.style.cssText='display:none;flex-direction:column;gap:6px;margin-top:6px';
+  /* 帧率只要一个输入框（面板顶部）：有了"点行才应用"这个明确提交点，
+     每行再放一个就是冗余。留空=只改分辨率；填了=分辨率+帧率一起改；
+     只改帧率 → 填好后点**当前那一行**（分辨率写回原值）。 */
+  var fpsRow=document.createElement('div');
+  fpsRow.style.cssText='display:flex;gap:8px;align-items:center';
+  var fpsLbl=document.createElement('span');
+  fpsLbl.textContent='帧率（留空=不改）';
+  fpsLbl.style.cssText='flex:1;color:var(--dim);font-family:inherit;font-size:12px';
+  var fpsInp=document.createElement('input');
+  fpsInp.type='number';fpsInp.min='1';fpsInp.max='120';fpsInp.step='1';
+  fpsInp.placeholder='帧率';fpsInp.inputMode='numeric';
+  fpsInp.title='留空=只改分辨率；填了=分辨率+帧率一起改';
+  fpsInp.style.cssText=_inpSt;
+  fpsInp.onkeydown=function(e){
+    if(e.key!=='Enter')return;
+    e.preventDefault();
+    var cur=null;
+    for(var i=0;i<_rows.length;i++){ if((_rows[i].w+'x'+_rows[i].h)===_curWH)cur=_rows[i]; }
+    if(cur)_resApply(cur.w,cur.h,fpsInp.value);        /* 回车 = 应用到当前档位 */
+  };
+  fpsRow.appendChild(fpsLbl);fpsRow.appendChild(fpsInp);
+  resPop.appendChild(fpsRow);
+  RES_OPTS.forEach(function(o){
+    var pick=document.createElement('button');
+    pick.textContent=o[0];
+    pick.title='点这里应用（帧率框留空则只改分辨率）';
+    pick.style.cssText='height:30px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer;text-align:center';
+    pick.onclick=function(){ _resApply(o[1],o[2],fpsInp.value); };
+    resPop.appendChild(pick);
+    _rows.push({label:o[0],w:o[1],h:o[2],pick:pick});
+  });
+  function _resPaint(txt){
+    if(!txt)return;
+    var p=txt.trim().split(':');            /* cur:wan:1920x1080:33 */
+    _curWH=p[2]||'';_curFps=p[3]||'';
+    var lab=_curWH;
+    for(var i=0;i<RES_OPTS.length;i++){ if((RES_OPTS[i][1]+'x'+RES_OPTS[i][2])===_curWH)lab=RES_OPTS[i][0]; }
+    resBtn.textContent=(lab||'--')+' ▾';
+    resBtn.title='当前 '+_curWH.replace('x','×')+(_curFps?(' @ '+_curFps+' 帧'):'')+'（'+(p[1]==='lan'?'局域网':'外网')+'配置）';
+    _rows.forEach(function(r){
+      var on=((r.w+'x'+r.h)===_curWH);
+      r.pick.style.borderColor=on?'var(--green)':'var(--border)';
+      r.pick.style.color=on?'var(--green)':'var(--dim)';
+      r.pick.textContent=r.label+(on?' ✓':'');
+    });
+  }
+  fetch(_BASE+'/resolution',{credentials:'include',cache:'no-store'})
+    .then(function(r){return r.ok?r.text():null;})
+    .then(function(t){ if(t!==null)_resPaint(t); })
+    .catch(function(){});
+  resBtn.onclick=function(){
+    var open=(resPop.style.display!=='none');
+    resPop.style.display=open?'none':'flex';
+  };
+  function _resApply(w,h,fpsRaw){
+    if(_resBusy)return;
+    var fps=(fpsRaw||'').trim();
+    if(fps&&!/^[0-9]+$/.test(fps)){ alert('帧率要填整数'); return; }
+    if(fps&&(parseInt(fps,10)<1||parseInt(fps,10)>120)){ alert('帧率范围 1~120'); return; }
+    var wh=w+'x'+h,lab=wh;
+    for(var i=0;i<RES_OPTS.length;i++){ if((RES_OPTS[i][1]+'x'+RES_OPTS[i][2])===wh)lab=RES_OPTS[i][0]; }
+    var shown=fps||_curFps||'';            /* 没填帧率也要显示原始帧率 */
+    var msg='把分辨率改成 '+lab+(shown?(' '+shown+' 帧'):'')+'？\n\n服务会关闭，需要手动重启或由守护进程拉起。';
+    if(!confirm(msg))return;
+    _resBusy=true;resBtn.disabled=true;
+    _rows.forEach(function(r){ r.pick.disabled=true; });fpsInp.disabled=true;
+    /* 与 Shutdown 按钮一致：直接跳过去，不做 reload */
+    location.href=_BASE+'/resolution?w='+w+'&h='+h+(fps?('&fps='+fps):'');
+  }
+  var rowL=document.createElement('div');rowL.style.cssText='display:flex;gap:8px';
+  rowL.appendChild(resBtn);rowL.appendChild(la);
+  b.appendChild(rowL);b.appendChild(resPop);
   var c=document.createElement('button');c.textContent='Cancel';
   c.style.cssText='height:36px;border:1px solid var(--border);background:var(--surface);color:var(--dim);font-family:inherit;font-size:12px;cursor:pointer';
   c.onclick=function(){d.remove()};

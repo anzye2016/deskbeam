@@ -203,6 +203,8 @@ COOKIE_NAME = "deskbeam_session"
 TOTP_SECRET = _cfg.get("totp_secret", "").strip()
 # 拒绝来自局域网的直连（默认关闭该限制）。只认显式的 false/0/no/off/空。
 LAN_ACCESS = str(_cfg.get("lan_access", True)).strip().lower() not in ("false", "0", "no", "off", "")
+# 设置卡片里"分辨率"下拉允许的取值：(宽, 高)；(0, 0) = 原始分辨率（不缩放）。
+_RES_ALLOWED = {(0, 0), (1280, 720), (1920, 1080), (2560, 1440)}
 MAX_FPS = max(_get_int("max_fps", 15), 1)
 GOP_SIZE = max(_get_int("gop", 10), 1)
 AUDIT_LOG = SCRIPT_DIR / "audit.log"
@@ -730,6 +732,67 @@ async def http_handler(connection, request):
             words = ["on" if want else "off"] + ([] if saved else ["unsaved"])
         else:
             words = ["on" if LAN_ACCESS else "off"]
+        return Response(200, "OK", Headers({
+            "Content-Type": "text/plain; charset=utf-8",
+            "Cache-Control": "no-store",
+        }), ":".join(words).encode("utf-8"))
+
+    if path.split("?", 1)[0] == "/resolution":
+        # 设置卡片里的分辨率选择：GET 读当前值，GET ?w=&h= 改值。
+        #
+        # 三个要点：
+        #   1. 写哪一对键（wan_width/height 还是 lan_width/height）由**服务端**
+        #      按请求来源判定，不用客户端的 _isLan —— Tailscale 的 100.64/10 在
+        #      _is_lan() 里被**有意排除**（跨公网，按 WAN 走），客户端可能以为自己
+        #      是局域网，两边不一致就会把键写错、改了没效果。
+        #   2. (0,0) = 原始分辨率（不缩放），其余只接受 720P/1080P/2K 三档。
+        #   3. 改完与 /shutdown **完全同一条路径**：落盘 → _server.close() →
+        #      守护进程拉起。所以这里不需要二次确认（和 Shutdown 按钮一致）。
+        if not _check_auth(request):
+            return Response(403, "Forbidden", Headers({}), b"Forbidden")
+        args = {}
+        if "?" in path:
+            for part in path.split("?", 1)[1].split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    args[k] = v
+        ip = _real_ip(request.headers, connection.remote_address[0] if connection.remote_address else "")
+        lan = _is_lan(ip)
+        kw, kh = ("lan_width", "lan_height") if lan else ("wan_width", "wan_height")
+        words = []
+        if "w" in args and "h" in args:
+            try:
+                w, h = int(args["w"]), int(args["h"])
+            except ValueError:
+                return Response(400, "Bad Request", Headers({}), b"bad w/h")
+            if (w, h) not in _RES_ALLOWED:
+                return Response(400, "Bad Request", Headers({}), b"unsupported size")
+            _cfg[kw], _cfg[kh] = w, h
+            if w and h:                     # soft_* 不接受 0，只在选了具体档位时跟随
+                _cfg["soft_width"], _cfg["soft_height"] = w, h
+            # 可选帧率：留空/不传就不动。WAN 写 max_fps，LAN 写 max_fps_lan。
+            fv = (args.get("fps") or "").strip()
+            if fv:
+                try:
+                    fps = int(float(fv))
+                except ValueError:
+                    return Response(400, "Bad Request", Headers({}), b"bad fps")
+                if not 1 <= fps <= 120:
+                    return Response(400, "Bad Request", Headers({}), b"fps out of range")
+                _cfg["max_fps_lan" if lan else "max_fps"] = fps
+            saved = True
+            try:
+                await asyncio.get_running_loop().run_in_executor(executor, _save_config)
+            except Exception:
+                traceback.print_exc()
+                saved = False
+            _audit("RESOLUTION %dx%d (%s)" % (w, h, "lan" if lan else "wan"), ip)
+            words = ["ok", "lan" if lan else "wan", "%dx%d" % (w, h)] + ([] if saved else ["unsaved"])
+            _server.close()                 # 与 /shutdown 一致：关监听，守护进程会拉起
+        else:
+            words = ["cur", "lan" if lan else "wan",
+                     "%dx%d" % (_get_int(kw, 0), _get_int(kh, 0)),
+                     str(_get_int("max_fps_lan" if lan else "max_fps", 0))]
         return Response(200, "OK", Headers({
             "Content-Type": "text/plain; charset=utf-8",
             "Cache-Control": "no-store",
