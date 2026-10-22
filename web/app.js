@@ -44,6 +44,15 @@ function _focusTouch(){
     try{ document.documentElement.scrollTop = 0; }catch(_){}
   }, 0);
 }
+/* 触点是否落在输入类元素里（#ti / #gti 是 <textarea>，还有 range input）。
+   触摸区的 touchstart/touchmove 靠 preventDefault 关掉移动端长按识别，但那会
+   连带掐掉 textarea 的原生滚动 —— 多行内容只能看最上面三行，划不动。
+   落在输入类元素上时整段跳过触摸板逻辑，完全交给浏览器（包括滚动、粘贴菜单）。 */
+function _inTextInput(t){
+  if(!t)return false;
+  var n=(t.nodeType===3)?t.parentNode:t;
+  return !!(n&&n.tagName&&/^(INPUT|TEXTAREA|SELECT)$/.test(n.tagName));
+}
 function _mkBtn(spec){
   if(spec.espHold)return _mkEspHold(spec);      /* ESP:按住时重发 hid_key(方向键/空格) */
   if(spec.espRepeat)return _mkEspRepeat(spec);  /* ESP:按住时重发任意动作(滚动/退格) */
@@ -943,7 +952,21 @@ function cnV(){
         }else if(m.type==='screen_paused'){
           _setPaused(true);
         }else if(m.type==='screen_resumed'){
+          /* 从"无信号"或安全桌面恢复。半死的 <video> 元素只重建媒体管线救不回来
+             （切标签页回来那次实测过），必须换一个全新的元素。 */
+          var _wasNoSig=_noSig;
+          _setNoSignal(false);
           _setPaused(false);
+          /* 恢复瞬间服务端还没重启采集（看门狗最多 8s 才轮到），这段时间没有帧是
+             正常的。给 _frameStall 一个协商宽限期 —— 否则一个停留十几秒的 UAC
+             会被判成"卡死"，白白拆一次 PeerConnection 甚至整条会话重连。
+             用 _mediaDeadline 而不是重置 _lastFrameAt：语义就是"正在协商/重启"。 */
+          _mediaDeadline=performance.now()+_NEGO_MS;
+          if(_wasNoSig){
+            console.warn('screen resumed after no-signal: rebuilding <video>');
+            _rebuildVideoEl();
+            _recoverMedia();
+          }
         }else if(m.type==='webrtc_offer'){
           var pc=new RTCPeerConnection({iceServers:_iceServers});_pc=pc;_rtcDc=null;
           pc.ontrack=function(e){
@@ -1500,7 +1523,10 @@ function _recoverMedia(){
   }catch(e){console.error('recoverMedia:',e);}
 }
 function _frameStall(){
-  if(_paused)return;
+  /* 安全桌面(_paused)与「无活动显示输出」(_noSig)期间采集根本不可能成功，
+     重建/重连都是白跑 —— 而且会在每个 GOP 上反复撞 NVENC。恢复交给服务端补发的
+     screen_resumed(见 _rtp_capture_loop)。 */
+  if(_paused||_noSig)return;
   if(!_so||!(wsV&&wsV.readyState===WebSocket.OPEN)||!_lastFrameAt)return;
   var now=performance.now();
   if(now-_lastFrameAt<=5000){_stallStage=0;_failStreak=0;return;}   /* 有帧:阶段复位 + 清失败计数 */
@@ -1613,6 +1639,7 @@ function _hArm(){
   },350);
 }
 ta.addEventListener('touchstart',function(e){
+  if(_inTextInput(e.target)){_hClear();return;}   /* textarea/input：交给浏览器(滚动/粘贴) */
   /* 触摸区**彻底关掉浏览器的原生长按识别** —— 只加 user-select/contextmenu 还不够,
      手机仍会有长按振动反馈(实测)。代价是浏览器不再为这块区域合成 click 事件;
      我们的单击是自己在 touchend 里实现的,不受影响。
@@ -1647,6 +1674,7 @@ ta.addEventListener('touchstart',function(e){
   else if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))_hArm();
 },{passive:false});
 ta.addEventListener('touchmove',function(e){
+  if(_inTextInput(e.target))return;    /* textarea 内滚动，别抢 */
   e.preventDefault();
   if(_pinching&&e.touches.length===2){
     var a=e.touches[0],b=e.touches[1];
@@ -1672,7 +1700,7 @@ ta.addEventListener('touchmove',function(e){
   _mqAcc(dx,dy);
 },{passive:false});
 ta.addEventListener('touchend',function(e){
-  _focusTouch();          /* 手势已结束:此时收键盘不会打乱布局/长按释放 */
+  if(!_inTextInput(e.target))_focusTouch();   /* textarea 内别抢焦点(会关键盘/失焦) */
   _hClear();
   if(_hHeld){ _hRelease(); _te=Date.now(); _lt=0; return; }   /* 长按:只 down+up,不 click */
   if(_pinching){
@@ -1948,7 +1976,7 @@ function _espMouse(o){
   _espSend(m);
 }
 function _espL(){_espMouse({btn:1});}
-document.addEventListener('touchmove',function(e){if(!e.target.closest('#ks')&&!e.target.closest('input'))e.preventDefault();},{passive:false});
+document.addEventListener('touchmove',function(e){if(!e.target.closest('#ks')&&!e.target.closest('input')&&!e.target.closest('textarea'))e.preventDefault();},{passive:false});
 function _bindHoldEl(el,dcmd,ucmd,nocancel,norepeat){
   if(!el)return;
   var iv=null,to=null,pr=false,sx=0,sy=0,sl=false,sTid=-1;
@@ -2350,7 +2378,8 @@ function _contentRect(el){
        手机仍会有长按振动反馈(实测)。代价是浏览器不再为这块区域合成 click 事件;
        我们的单击是自己在 touchend 里实现的,不受影响。
        #tpmsg("点击播放"覆盖层)必须例外:它需要浏览器合成的 click。 */
-    if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))e.preventDefault();
+    if(_inTextInput(e.target)){_hClear();return;}   /* textarea/input：交给浏览器(滚动/粘贴) */
+  if(!(e.target&&e.target.closest&&e.target.closest('#tpmsg')))e.preventDefault();
     /* 焦点在 GYRO 的 touchend 里交还(手势结束后) */
     if(tid!==-1)return;              /* 已有跟踪中的手指:第二根不劫持、不重启计时 */
     var t=e.changedTouches[0];
@@ -2368,6 +2397,7 @@ function _contentRect(el){
   },{passive:false});
 
   ta.addEventListener('touchmove',function(e){
+  if(_inTextInput(e.target))return;    /* textarea 内滚动，别抢 */
     e.preventDefault();
     var t=null;
     for(var i=0;i<e.touches.length;i++)if(e.touches[i].identifier===tid){t=e.touches[i];break;}
@@ -2383,7 +2413,7 @@ function _contentRect(el){
   },{passive:false});
 
   ta.addEventListener('touchend',function(e){
-    _focusTouch();        /* 手势结束后再交还焦点,避免中途收键盘 */
+    if(!_inTextInput(e.target))_focusTouch();   /* 手势结束后交还焦点;textarea 内不抢 */
     clearHold();
     tid=-1;
     if(held){ releaseHeld(); lastTap=0; return; }   /* 长按:只 down+up,不再 click */

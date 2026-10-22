@@ -1375,6 +1375,9 @@ class _VideoSession:
         # _rtp_capture_loop 用 —— 两个函数在不同作用域(secure_last 是局部变量,
         # 跨不过去),所以状态必须挂在 sess 上。
         self.secure_paused = False
+        # 采集曾因「无活动显示输出」失败并向客户端推过 screen_no_signal；
+        # 采集重新 alive 时要补一句 screen_resumed，否则客户端永远停在无信号态。
+        self.no_signal = False
         self.rtp_ref = None
         # 非 RTP 路径当前占用的 GPUStreamer,由 _gpu_sender 维护。set_mode 切
         # RTP 时先等它让位(见 ws_handler),避免两套 ffmpeg 并抢 NVENC/DXGI。
@@ -1495,6 +1498,7 @@ async def _start_rtp(sess):
         # 告诉客户端,别让它对着一个空白页无限重试还以为是网络问题。
         try:
             await sess.ws.send(json.dumps({"type": "screen_no_signal"}))
+            sess.no_signal = True
         except Exception:
             pass
         return None
@@ -1667,6 +1671,15 @@ async def _rtp_capture_loop(sess):
             alive = True            # 查询失败不当作死亡,下一轮再看
         if alive:
             backoff = _RTP_CAP_INTERVAL
+            if getattr(sess, "no_signal", False):
+                # 采集回来了（显示器唤醒 / 线插回去 / 虚拟显示器就绪）。客户端那个半死的
+                # <video> 元素只能靠重建救回来，所以补一句让它动手。
+                sess.no_signal = False
+                _gpu_dbg("rtp capture recovered -> screen_resumed")
+                try:
+                    await sess.ws.send(json.dumps({"type": "screen_resumed"}))
+                except Exception:
+                    pass
             continue
         _gpu_dbg("rtp capture died (secure desktop left?) -> restarting streamer")
         try:
