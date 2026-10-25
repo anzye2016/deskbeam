@@ -1701,6 +1701,41 @@ async def _rtp_capture_loop(sess):
         backoff = min(_RTP_CAP_BACKOFF_MAX, backoff * 2)
 
 
+async def _rtp_wait_capture(sess, websocket):
+    """采集建不起来时(最常见:息屏状态下就连上来)在后台持续重试,直到成功。
+
+    原来失败只回一句 rtp_failed 就结束 —— **没有任何人重试**。用户滑动触摸板唤醒
+    屏幕后采集依然不会启动,必须刷新页面(重连 + 重建会话)才出画面。
+
+    成功时补发 screen_resumed:客户端据此 `_rebuildVideoEl()` + `_recoverMedia()`,
+    自己重发 `set_mode{format:'rtp'}`,码率/关键帧/采集看门狗三条循环由那条路径创建。
+    """
+    backoff = 2.0
+    while sess.running:
+        await asyncio.sleep(backoff)
+        backoff = min(8.0, backoff * 2)
+        if sess.rtp:                        # 客户端自己已经恢复成功,别重复起
+            return
+        if getattr(sess, "secure_paused", False):
+            continue                        # 安全桌面期间重启用不了
+        transport = None
+        try:
+            sess.rtp_pending = True
+            transport = await _start_rtp(sess)
+        except Exception as e:
+            _gpu_dbg(f"rtp wait-capture: start failed {e!r}")
+        finally:
+            sess.rtp_pending = False
+        if transport is not None:
+            _gpu_dbg("rtp wait-capture: capture available -> screen_resumed")
+            sess.no_signal = False
+            try:
+                await websocket.send(json.dumps({"type": "screen_resumed"}))
+            except Exception:
+                pass
+            return
+
+
 async def _rtp_bitrate_loop(sess, transport):
     """RTP 拥塞判断:RTCP RR 的丢包率 + RTT(相对**滑动窗口最小值**基线的排队量)。
     丢包驱动"真丢包"型拥塞;RTT 驱动"只加延迟不丢包"型瓶颈(如 Tailscale DERP
@@ -2261,6 +2296,12 @@ async def ws_handler(websocket):
                     sess.rtp_pending = False
                     if transport is None:
                         await websocket.send(json.dumps({"type": "rtp_failed", "reason": "no streamer"}))
+                        # 采集建不起来(常见于**息屏状态**下连上来)。没有任何人重试的话,
+                        # 用户唤醒屏幕后必须刷新页面才会出画面 —— 后台重试,成功后补发
+                        # screen_resumed,让客户端重建媒体。
+                        _wtask = asyncio.create_task(_rtp_wait_capture(sess, websocket))
+                        _BACKGROUND_TASKS.add(_wtask)
+                        _wtask.add_done_callback(_BACKGROUND_TASKS.discard)
                     else:
                         _task = asyncio.create_task(_rtp_bitrate_loop(sess, transport))
                         _BACKGROUND_TASKS.add(_task)
