@@ -34,6 +34,14 @@ function _pullClipboard(){ sendCmd({type:'get_clipboard'}); }
    不会自动把焦点从输入框挪走,所以显式做。
    **必须延后到手势结束**:在 touchstart 里同步失焦会让软键盘在手势中途收起,
    布局回落错位(实测:输入框掉到原位以下、键盘行被挤出屏幕)。 */
+/* 前端诊断上报：只发低频关键事件，服务端写进 gpu_stream_debug.txt。
+   偶发故障时两端时间线能对照；一次会话十几条，开销可忽略。 */
+function _clog(ev,extra){
+  try{
+    if(wsV&&wsV.readyState===WebSocket.OPEN)
+      wsV.send(JSON.stringify({type:'client_log',ev:ev,d:(extra===undefined?'':String(extra))}));
+  }catch(_){}
+}
 function _focusTouch(){
   var id = (typeof _gm!=='undefined' && _gm && document.getElementById('gta')) ? 'gta' : 'ta';
   setTimeout(function(){
@@ -483,8 +491,7 @@ function _startRtpStats(pc){
 function _sendScreenMode(){
   if(!(wsV&&wsV.readyState===WebSocket.OPEN))return '';
   var fmt;
-  if(typeof RTCPeerConnection!=='undefined'&&typeof VideoDecoder==='undefined')fmt='webrtc';
-  else if(_useUdp())fmt='rtp';
+  if(_useUdp())fmt='rtp';
   else fmt='tcp';
   /* 记住这次要用哪条传输:_setupDecoder 据此决定要不要建 WebCodecs 解码器。
      RTP 的画面由 <video> 渲染,建出来的解码器一帧都收不到、随即被 _rtpRecv 关掉。 */
@@ -495,9 +502,9 @@ function _sendScreenMode(){
      first_frame ≤2s + offer),而看门狗阈值是 5s —— 不给宽限期就会在会话
      即将成功的瞬间把它拆掉重来,表现成"切 UDP 进画面特别慢甚至进不去"。 */
   _mediaDeadline=performance.now()+_NEGO_MS;
-  if(fmt==='webrtc')wsV.send(JSON.stringify({type:'set_mode',screen:true,format:'webrtc'}));
-  else if(fmt==='rtp')wsV.send(JSON.stringify({type:'set_mode',screen:true,format:'rtp'}));
+  if(fmt==='rtp')wsV.send(JSON.stringify({type:'set_mode',screen:true,format:'rtp'}));
   else wsV.send(JSON.stringify({type:'set_mode',screen:true}));
+  _clog('send_mode',fmt+' udp='+_useUdp()+' manual='+_prefManual);
   return fmt;
 }
 function _startScreenVideo(){
@@ -514,13 +521,7 @@ function sm(on){
     document.getElementById('pz').style.display='';document.getElementById('ph').innerHTML='';_fts=[];
     if(wsV&&wsV.readyState===WebSocket.OPEN){
       var fmt=_sendScreenMode();
-      if(fmt==='webrtc'){
-        var td=document.createElement('div');
-        td.style.cssText='position:fixed;left:50%;top:12px;transform:translateX(-50%);background:rgba(0,0,0,.85);color:#ffd166;border:1px solid #ffd166;padding:6px 14px;font-size:11px;letter-spacing:.05em;z-index:2000;border-radius:3px;font-family:inherit;pointer-events:none;white-space:nowrap';
-        td.textContent='当前浏览器无 VideoDecoder,使用 WebRTC 兜底(30fps+高延迟)。建议 Chrome/Edge';
-        document.body.appendChild(td);
-        setTimeout(function(){try{td.remove()}catch(_){}},5000);
-      }else if(fmt==='rtp'){
+      if(fmt==='rtp'){
         // UDP 协商超时兜底:服务端冷启动 RTP(切流让位 ≤2s + 编码器探测 0.5s +
         // first_frame ≤2s + offer)最坏 ~5s,给 8s 余量;超时才回退 TCP。
         if(_rtpTimer){clearTimeout(_rtpTimer);}
@@ -967,25 +968,8 @@ function cnV(){
             _rebuildVideoEl();
             _recoverMedia();
           }
-        }else if(m.type==='webrtc_offer'){
-          var pc=new RTCPeerConnection({iceServers:_iceServers});_pc=pc;_rtcDc=null;
-          pc.ontrack=function(e){
-            if(e.track&&e.track.kind!=='video')return;   /* 该路径无音轨,防御性跳过 */
-            var tv=_gm?document.getElementById('gv'):document.getElementById('vd');
-            if(_gm){document.getElementById('gc').style.display='none';}
-            else{cv.style.display='none';}
-            tv.style.display='block';_vidGen++;tv.srcObject=e.streams[0];_playVid(tv);
-          };
-          pc.ondatachannel=function(e){_rtcDc=e.channel;};
-          pc.setRemoteDescription(new RTCSessionDescription({sdp:m.sdp,type:m.sdp_type})).then(function(){return pc.createAnswer()}).then(function(a){
-            pc.setLocalDescription(a);wsV.send(JSON.stringify({type:'webrtc_answer',sdp:a.sdp,sdp_type:a.type}));
-          });
-          pc.onicecandidate=function(e){
-            if(e.candidate&&wsV)wsV.send(JSON.stringify({type:'webrtc_ice',candidate:{candidate:e.candidate.candidate,sdpMid:e.candidate.sdpMid||'0',sdpMLineIndex:e.candidate.sdpMLineIndex||0}}));
-          };
-        }else if(m.type==='webrtc_ice'){
-          if(_pc){try{_pc.addIceCandidate(new RTCIceCandidate(m.candidate))}catch(ex){}}
         }else if(m.type==='rtp_offer'){
+          _clog('offer_recv','sdp='+(m.sdp?m.sdp.length:0));
           _rtpRecv(m);
         }else if(m.type==='rtp_ice'){
           if(_pc){try{_pc.addIceCandidate(new RTCIceCandidate(m.candidate))}catch(ex){}}
@@ -1071,6 +1055,7 @@ function _rtpRecv(m){
   _avStream=new MediaStream();
   pc.ontrack=function(e){
     if(!e.track)return;
+    _clog('ontrack',e.track.kind);
     if(e.track.kind==='video'){try{_avStream.addTrack(e.track);}catch(_){}}
     if(e.track.kind!=='video'){
       /* 音频轨只并进 MediaStream,绝不重设 srcObject —— 那会把视频轨挤掉。 */
@@ -1143,7 +1128,13 @@ function _rtpRecv(m){
   // disconnected 在短时网络抖动也会出现,延时确认持续失联再重连。
   pc.oniceconnectionstatechange=function(){
     var s=pc.iceConnectionState;
-    if(s==='failed'||s==='closed'){
+    _clog('ice',s);
+    /* 只处理**当前**这条 PC。收到新 offer 时 _rtpRecv 会 _pc.close() 关掉旧的,
+       旧 PC 随即进入 'closed' —— 以前这里不分新旧，一看到 closed 就 wsV.close()
+       关掉整条 WebSocket，于是服务端拆会话→重连→又是新 offer→旧 PC 再 closed，
+       形成 3~5 秒一轮的死循环（表现就是"偶发没画面、刷新一下好一阵"）。 */
+    if(pc!==_pc)return;
+    if(s==='failed'){
       if(!_rtpMode)return;
       if(wsV&&wsV.readyState===WebSocket.OPEN)wsV.close();
     }else if(s==='disconnected'){
@@ -1162,6 +1153,7 @@ function _rtpRecv(m){
     return pc.setLocalDescription(a);
   }).then(function(){
     if(wsV&&wsV.readyState===WebSocket.OPEN){
+      _clog('answer_sent');
       wsV.send(JSON.stringify({type:'rtp_answer',sdp:pc.localDescription.sdp,sdp_type:pc.localDescription.type}));
     }
   }).catch(function(ex){console.error('RTP answer:',ex);_rtpFail();});
@@ -1492,6 +1484,7 @@ function _rebuildVideoEl(){
 }
 /* 13s 协商超时:先打诊断再回退。区分"没收到轨"和"有轨没帧"。 */
 function _negoTimeout(){
+  _clog('nego_timeout','rtpMode='+_rtpMode+' pc='+(_pc?_pc.connectionState:'-'));
   try{
     var recv=(_pc&&_pc.getReceivers)?_pc.getReceivers():[];
     var vd=document.getElementById('vd');
@@ -1540,6 +1533,7 @@ function _frameStall(){
        或单条媒体通道的问题,不是会话故障——直接 ws.close() 要白白付一次
        完整重连的代价。 */
     _stallStage=1;
+    _clog('stall','stage1 rtpMode='+_rtpMode+' noSig='+_noSig+' paused='+_paused);
     console.warn('frame stall: rebuilding media pipeline (session kept)');
     _recoverMedia();
     return;

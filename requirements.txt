@@ -1,9 +1,7 @@
 websockets>=13.0
-dxcam>=0.3.0
 av>=14.0
 numpy>=2.0
 aiortc>=1.15.0
-opencv-python-headless>=4.8
 # PC 音频(WASAPI 回环,仅 Windows)-> RTP 音轨。缺失时音频功能自动关闭,
 # 视频不受影响。见 audio_stream.py。
 PyAudioWPatch>=0.2.12; sys_platform == "win32"

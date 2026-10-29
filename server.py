@@ -24,30 +24,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 try:
-    import cv2
-except ImportError:
-    cv2 = None
-
-try:
-    import capture
-except ImportError:
-    capture = None
-
-try:
     import speech
 except ImportError:
     speech = None
 
-try:
-    from encoder import H264Encoder, has_idr
-except ImportError:
-    H264Encoder = None
-    has_idr = None
-
-try:
-    from webrtc_streamer import WebRTCSession
-except ImportError:
-    WebRTCSession = None
 
 try:
     from rtp_stream import RTPVideoTransport, apply_packet_mtu
@@ -639,7 +619,7 @@ def _avc1_codec(width, height, fps, enc=""):
 
 
 _GPU_READY = _HAS_FFMPEG and GPUStreamer is not None
-_STREAMING = _cfg.get("streaming", True) and (_GPU_READY or (capture is not None and capture.HAS_DXCAM and capture.HAS_AV))
+_STREAMING = _cfg.get("streaming", True) and _GPU_READY
 _GPU_START_RETRIES = 2
 _GPU_START_RETRY_DELAY = 1.5
 # In-place respawns after a running streamer dies (DXGI access loss). Well
@@ -1352,10 +1332,82 @@ def _rtp_sync_pacer(sess):
     sess.rtp.set_pacer_bps(int(cur_bps * ratio))
 
 
+class _MediaPipeline:
+    """一个会话**当前**媒体管线的唯一 owner。
+
+    收敛了原来散在 `_VideoSession` 上的四个字段：
+
+        rtp             RTPVideoTransport（音视频轨）
+        rtp_ref         [GPUStreamer]（可热替换）
+        rtp_pending     正在冷启动 RTP（gating 非 RTP sender 让位）
+        tcp_streamer    TCP 路径的 GPUStreamer
+
+    为什么值得单独成类：桌面复制（ddagrab）是**独占**资源，只要有一个 streamer
+    没关，后续采集就会 "Device or resource busy"，然后整链路瘫痪。历史上就是
+    "谁都能建、没人负责关" —— `stop()` 成为**唯一**清理入口后，这个问题从结构上
+    消失（配合 GPUStreamer.alive() 的 5 秒无帧判死）。
+    """
+
+    __slots__ = ("rtp", "rtp_ref", "rtp_pending", "tcp_streamer", "last_restart_at")
+
+    def __init__(self):
+        self.rtp = None
+        self.rtp_ref = None
+        self.rtp_pending = False
+        self.tcp_streamer = None
+        self.last_restart_at = 0.0
+
+    # ── 查询 ──
+    def streamer(self):
+        """当前**持有 ffmpeg** 的 streamer（RTP 优先，其次 TCP）。"""
+        if self.rtp_ref and self.rtp_ref[0] is not None:
+            return self.rtp_ref[0]
+        return self.tcp_streamer
+
+    def kind(self):
+        if self.rtp_ref and self.rtp_ref[0] is not None:
+            return "rtp"
+        if self.tcp_streamer is not None:
+            return "tcp"
+        return ""
+
+    def busy(self):
+        """有任意一条管线在建或已在跑。"""
+        return bool(self.rtp or self.rtp_pending or self.streamer() is not None)
+
+    # ── 唯一清理入口 ──
+    async def stop(self):
+        """关掉 RTP 传输**和它的 GPUStreamer**，并清空所有引用。
+
+        只关 transport 是不够的：真正持有 ffmpeg（ddagrab/NVENC）的是
+        `rtp_ref[0]`。漏关会留下 25 Mbps 空转、队列 16 满的孤儿，几个之后
+        ddagrab 被占满、新采集全失败（实测）。
+        """
+        ref = self.rtp_ref
+        if ref and ref[0] is not None:
+            st = ref[0]
+            ref[0] = None
+            try:
+                # 同步 close() 里有 wait(3s)，会阻塞事件循环 → 线程池
+                await asyncio.get_running_loop().run_in_executor(executor, st.close)
+            except Exception:
+                traceback.print_exc()
+        if self.rtp:
+            try:
+                await self.rtp.close()
+            except Exception:
+                traceback.print_exc()
+        self.rtp = None
+        self.rtp_ref = None
+
+
 class _VideoSession:
     """Per-connection video-channel state shared by the sender pipelines."""
 
     def __init__(self, websocket, lan, fps, gop, cq, preset, maxrate, bufsize, ice_servers):
+        # 媒体管线的唯一 owner。必须在下面任何 `self.rtp = ...` 之前建好
+        # （那些赋值走下面的 property 代理）。
+        self.pipeline = _MediaPipeline()
         self.ws = websocket
         self.loop = asyncio.get_running_loop()
         self.lan = lan
@@ -1368,7 +1420,6 @@ class _VideoSession:
         self.ice_servers = ice_servers
         self.running = True
         self.streaming = False
-        self.webrtc = None
         self.rtp = None
         self.rtp_pending = False
         # 安全桌面(UAC/锁屏)状态。由 _gpu_sender 里的 _secure_watch 维护,给
@@ -1398,6 +1449,47 @@ class _VideoSession:
         self._base_cq = cq
         self._base_maxrate = maxrate
         self._base_bufsize = bufsize
+
+    # ── 媒体管线字段代理：真实状态在 self.pipeline 里，调用点不用改 ──
+    @property
+    def rtp(self):
+        return self.pipeline.rtp
+
+    @rtp.setter
+    def rtp(self, v):
+        self.pipeline.rtp = v
+
+    @property
+    def rtp_ref(self):
+        return self.pipeline.rtp_ref
+
+    @rtp_ref.setter
+    def rtp_ref(self, v):
+        self.pipeline.rtp_ref = v
+
+    @property
+    def rtp_pending(self):
+        return self.pipeline.rtp_pending
+
+    @rtp_pending.setter
+    def rtp_pending(self, v):
+        self.pipeline.rtp_pending = v
+
+    @property
+    def tcp_streamer(self):
+        return self.pipeline.tcp_streamer
+
+    @tcp_streamer.setter
+    def tcp_streamer(self, v):
+        self.pipeline.tcp_streamer = v
+
+    @property
+    def _last_restart_at(self):
+        return self.pipeline.last_restart_at
+
+    @_last_restart_at.setter
+    def _last_restart_at(self, v):
+        self.pipeline.last_restart_at = v
 
     def effective_params(self):
         """Encoder parameters. Bandwidth adaptation happens at the send side
@@ -1432,26 +1524,6 @@ class _VideoSession:
         }))
 
 
-def _soft_clamp(fps, gop):
-    """Clamp fps/gop for CPU-bound software pipelines (PyAV soft encode,
-    WebRTC software track). Identity when a hardware encoder is available.
-    The ffmpeg GPU pipeline is never clamped here — capture.IS_SOFT only
-    reflects PyAV's capability, not ffmpeg's, and GPUStreamer downscales
-    itself when it ends up on libx264."""
-    if capture is not None and capture.IS_SOFT:
-        fps = min(fps, _SOFT_FPS)
-        gop = min(gop, fps)
-    return fps, gop
-
-
-async def _webrtc_timeout(sess):
-    await asyncio.sleep(30)
-    if sess.webrtc:
-        state = sess.webrtc._pc.iceConnectionState
-        if state not in ("connected", "completed"):
-            await sess.webrtc.close()
-            sess.webrtc = None
-            print(f"  WebRTC timeout (state={state})")
 
 
 async def _rtp_start_streamer(sess):
@@ -1568,7 +1640,7 @@ async def _start_rtp(sess):
     return transport
 
 
-async def _rtp_restart_streamer(sess):
+async def _rtp_restart_streamer(sess, force=False):
     """Rebuild the RTP streamer at the current bitrate tier and swap it into
     the live transport (the track reads sess.rtp_ref[0] each recv). Serialised
     by sess.rtp_lock: the bitrate loop and the keyframe loop both call this."""
@@ -1577,17 +1649,24 @@ async def _rtp_restart_streamer(sess):
         return
     # 档位已经变了(sess._bitrate_tier 由调用方先更新),把 pacer 目标对齐过去。
     _rtp_sync_pacer(sess)
+    loop = asyncio.get_running_loop()
+    if not force and (time.monotonic() - getattr(sess, "_last_restart_at", 0.0)) < _RTP_RESTART_COALESCE:
+        _gpu_dbg("RTP restart skipped (coalesced within %.1fs)" % _RTP_RESTART_COALESCE)
+        return
     async with sess.rtp_lock:
         # **先关旧的、再建新的**：ddagrab(桌面复制)同一时间只允许一个占用者。
         # 原来先建新的、失败就直接 return，旧的永远不关 —— 于是新 streamer 必然
         # "Device or resource busy"，每次重试再留一个孤儿，最后全员失败、只能重启
         # 服务(实测 4 个孤儿把自己锁死)。
         old = ref[0]
-        try:
-            old.close()
-        except Exception:
-            pass
+        if old is not None:
+            try:
+                # close() 里 wait(timeout=3) 会阻塞事件循环,最坏让**所有会话**卡 3 秒
+                await loop.run_in_executor(executor, old.close)
+            except Exception:
+                traceback.print_exc()
         ref[0] = None
+        sess._last_restart_at = time.monotonic()
         new_s = await _rtp_start_streamer(sess)
         if new_s is None:
             _gpu_dbg("RTP restart: new streamer failed (ddagrab busy?) -> old already closed")
@@ -1596,6 +1675,10 @@ async def _rtp_restart_streamer(sess):
         _gpu_dbg(f"RTP restart streamer (tier {sess._bitrate_tier})")
 
 
+# 三条循环(采集看门狗 / 码率分档 / PLI)都会请求重建 streamer。rtp_lock 只保证
+# 不并发，不保证不重复 —— 它们可能在几秒内各触发一次，白付 3 次"重启 + IDR 突发"。
+# 这个窗口内的重复请求直接跳过；采集**真死**时用 force=True 绕过。
+_RTP_RESTART_COALESCE = 2.0
 _RTP_KEY_COOLDOWN = 1.5  # 两次按需关键帧之间的最小间隔(秒)
 # 只有"距下一个自然 IDR 还很久"时,重建编码器才划算:重建要 ~0.5-2s 且有帧空窗,
 # 而 gop/fps 就是自然 IDR 间隔(当前 gop=15 @32fps ≈ 0.47s,等自然 IDR 更快)。
@@ -1663,6 +1746,40 @@ _RTP_CAP_INTERVAL = 1.0
 _RTP_CAP_BACKOFF_MAX = 8.0
 
 
+def session_health(sess):
+    """当前媒体管线的存活快照 —— **判断采集死活的唯一入口**。
+
+    返回 {"kind": "rtp"|"tcp"|None, "alive": bool, "reason": str}。
+
+    原来两处各写一遍：RTP 看门狗看 `rtp_ref[0].alive()`（还额外判 secure_paused），
+    TCP sender 看本地 `streamer.alive()`（还自己数 deaths）。语义相同却要改两处，
+    今天那种"进程活着但不产帧"的判定也是分散在各自手里的。统一到这里。
+
+    `alive()` 自身已包含"5 秒内无帧即判死"（见 GPUStreamer.ALIVE_NOFRAME_S），
+    所以进程卡住不出帧、或 ddagrab 失效，这里都会返回 alive=False。
+    查询抛异常时按"活着"处理（沿用原约定：一次读失败不该触发重建）。
+    """
+    h = {"kind": None, "alive": False, "reason": ""}
+    if getattr(sess, "secure_paused", False):
+        h["reason"] = "secure-desktop"
+        return h
+    pipe = sess.pipeline
+    s = pipe.streamer()
+    h["kind"] = pipe.kind()
+    if s is None:
+        h["reason"] = "no-streamer"
+        return h
+    try:
+        h["alive"] = bool(s.alive())
+    except Exception:
+        h["alive"] = True
+        h["reason"] = "probe-failed"
+        return h
+    if not h["alive"]:
+        h["reason"] = "exited-or-no-frames"
+    return h
+
+
 async def _rtp_capture_loop(sess):
     backoff = _RTP_CAP_INTERVAL
     while sess.running and sess.rtp:
@@ -1674,13 +1791,9 @@ async def _rtp_capture_loop(sess):
             backoff = _RTP_CAP_INTERVAL
             continue
         ref = getattr(sess, "rtp_ref", None)
-        s = ref[0] if ref else None
-        if s is None:
+        if ref is None or ref[0] is None:
             continue
-        try:
-            alive = s.alive()
-        except Exception:
-            alive = True            # 查询失败不当作死亡,下一轮再看
+        alive = session_health(sess)["alive"]     # 判死规则只在 session_health 里
         if alive:
             backoff = _RTP_CAP_INTERVAL
             if getattr(sess, "no_signal", False):
@@ -1695,7 +1808,7 @@ async def _rtp_capture_loop(sess):
             continue
         _gpu_dbg("rtp capture died (secure desktop left?) -> restarting streamer")
         try:
-            await _rtp_restart_streamer(sess)
+            await _rtp_restart_streamer(sess, force=True)   # 采集真死,别被合并窗口挡掉
         except Exception as e:
             _gpu_dbg(f"rtp capture restart failed: {e!r}")
         backoff = min(_RTP_CAP_BACKOFF_MAX, backoff * 2)
@@ -1734,6 +1847,63 @@ async def _rtp_wait_capture(sess, websocket):
             except Exception:
                 pass
             return
+
+
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+_awake_n = 0
+
+
+def _keep_awake(on):
+    """推流期间按住显示器/系统电源状态（计数器，支持多会话）。
+
+    DXGI 桌面复制在屏幕休眠(或锁屏)后会 ACCESS_LOST —— ddagrab 报 887a0026，
+    ffmpeg 虽然起来了但 fps=0、一帧都拿不到，表现就是"连上了没画面"，
+    而且唤醒屏幕前怎么重启采集都没用（实测 21 次 ACCESS_LOST、本机显示器
+    5 分钟就关、powercfg /requests 一直是空的）。
+
+    远程串流时本机屏幕本来就是黑着的，所以必须由服务端主动按住。代价是
+    串流期间屏幕保持点亮；不想亮屏只能接 EDID 假负载/虚拟显示器。
+    """
+    global _awake_n
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        prev = _awake_n
+        _awake_n = max(0, _awake_n + (1 if on else -1))
+        if prev == 0 and _awake_n > 0:
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED)
+            # 只"按住电源状态"能防止**将来**休眠，但**唤不醒已经睡着的显示器**。
+            # 远程用时屏幕多半已经黑了 —— 推流开始必须主动戳一下(1px 相对移动再回来)，
+            # 否则 ddagrab 拿不到帧、fps=0、客户端 13s 后判协商失败(实测就是
+            # "切 GYRO 再开 video 一直没画面")。光标抖动 1px 无感。
+            try:
+                _u = ctypes.windll.user32
+                _u.mouse_event(0x0001, 1, 0, 0, 0)    # MOUSEEVENTF_MOVE, +1px
+                _u.mouse_event(0x0001, -1, 0, 0, 0)   # 移回来
+            except Exception:
+                pass
+            print("  display sleep inhibited (streaming)")
+        elif prev > 0 and _awake_n == 0:
+            ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+            print("  display sleep inhibition released")
+    except Exception as e:
+        print(f"  keep-awake failed: {e!r}")
+
+
+async def _close_rtp(sess):
+    """关掉 RTP 传输**和它的 GPUStreamer**。
+
+    只 `sess.rtp.close()` 是不够的：transport 只是音视频轨，真正持有 ffmpeg
+    （ddagrab / NVENC）的是 `sess.rtp_ref[0]`。漏关就会在每次"关视频 / 切 GYRO /
+    切回 SCREEN"后留下一个空转的 streamer（实测 3 个、各 25 Mbps、dropped≈produced、
+    队列 16 满），几个之后 ddagrab 被占满，新的采集全部失败 —— 现象就是切来切去
+    最后没画面。
+    """
+    await sess.pipeline.stop()
 
 
 async def _rtp_bitrate_loop(sess, transport):
@@ -1843,141 +2013,6 @@ async def _rtp_bitrate_loop(sess, transport):
         await asyncio.sleep(2.0)
 
 
-async def _legacy_sender(sess):
-    """Pipeline: capture thread -> encode thread -> sender paced by absolute schedule."""
-    fps, gop = _soft_clamp(sess.fps, sess.gop)
-    interval = 1.0 / fps
-    lan = sess.lan
-    stop = threading.Event()
-    raw_q = queue.Queue(maxsize=2)
-    out_q = queue.Queue(maxsize=2)
-    encoder = None
-
-    def _drop_oldest(q):
-        try:
-            q.get_nowait()
-        except queue.Empty:
-            pass
-
-    def capture_worker():
-        cap_dt = interval * 0.95
-        last_cap = 0.0
-        last_pos = None
-        while not stop.is_set():
-            if sess.streaming and _STREAMING and not sess.webrtc and not sess.rtp and not sess.rtp_pending:
-                try:
-                    _pos = get_cursor_pos()
-                    if _pos != last_pos:
-                        last_pos = _pos
-                        cap_dt = interval * 0.95
-                    else:
-                        cap_dt = 0.05
-                except Exception:
-                    cap_dt = interval * 0.95
-                now = time.monotonic()
-                if now < last_cap:
-                    time.sleep(last_cap - now)
-                    continue
-                try:
-                    raw, _, _ = capture.capture_screen_raw()
-                    if raw is not None:
-                        if raw_q.full():
-                            _drop_oldest(raw_q)
-                        raw_q.put(raw)
-                except Exception:
-                    pass
-                last_cap = time.monotonic() + cap_dt
-            else:
-                time.sleep(0.5)
-
-    def encode_worker():
-        nonlocal encoder
-        while not stop.is_set():
-            if not (sess.streaming and _STREAMING and not sess.webrtc and not sess.rtp and not sess.rtp_pending):
-                time.sleep(0.5)
-                continue
-            try:
-                raw = raw_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            try:
-                if encoder is None:
-                    h, w = raw.shape[:2]
-                    if not lan and _WAN_W and cv2 is not None:
-                        ew, eh = _WAN_W, _WAN_H
-                    elif capture is not None and capture.IS_SOFT and cv2 is not None:
-                        ew, eh = _SOFT_WIDTH, _SOFT_HEIGHT
-                    else:
-                        ew = _get_int("lan_width", 0) or w
-                        eh = _get_int("lan_height", 0) or h
-                    cq, maxrate, bufsize = sess.effective_params()
-                    encoder = H264Encoder(ew, eh, fps=fps, gop=gop, cq=cq,
-                                          maxrate=maxrate, bufsize=bufsize,
-                                          preset=sess.preset)
-                    while not out_q.empty():
-                        _drop_oldest(out_q)
-                    out_q.put(("config", ew, eh, w, h, encoder.enc_name))
-                frame = raw
-                if cv2 is not None and (raw.shape[1], raw.shape[0]) != (ew, eh):
-                    frame = cv2.resize(raw, (ew, eh))
-                h264 = encoder.encode(frame)
-                if h264:
-                    if out_q.full():
-                        _drop_oldest(out_q)
-                    out_q.put(("data", has_idr(h264), h264))
-            except Exception:
-                traceback.print_exc()
-                if encoder is not None:
-                    try:
-                        encoder.close()
-                    except Exception:
-                        pass
-                    encoder = None
-
-    threading.Thread(target=capture_worker, daemon=True).start()
-    threading.Thread(target=encode_worker, daemon=True).start()
-
-    dropper = _FrameDropper(sess.gop, sess.fps)
-    try:
-        next_send = time.monotonic()
-        while sess.running:
-            if sess.streaming and _STREAMING and not sess.webrtc and not sess.rtp and not sess.rtp_pending:
-                if sess._keyframe_request.is_set():
-                    sess._keyframe_request.clear()
-                    if encoder is not None:
-                        encoder.close()
-                        encoder = None
-                    continue
-                try:
-                    item = out_q.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.005)
-                    continue
-                now = time.monotonic()
-                if next_send > now:
-                    await asyncio.sleep(next_send - now)
-                if item[0] == "config":
-                    await sess.send_config(item[1], item[2], item[3], item[4], fps, item[5])
-                else:
-                    if dropper.keep(item[1], sess._bitrate_tier):
-                        await sess.ws.send(_frame_packet(item[1], sess.frame_seq, item[2]))
-                        sess.frame_seq += 1
-                next_send += interval
-            else:
-                if encoder is not None:
-                    encoder.close()
-                    encoder = None
-                next_send = time.monotonic()
-                await asyncio.sleep(0.5)
-    except websockets.exceptions.ConnectionClosed:
-        return
-    finally:
-        stop.set()
-        if encoder is not None:
-            try:
-                encoder.close()
-            except Exception:
-                pass
 
 
 async def _gpu_sender(sess):
@@ -2053,8 +2088,8 @@ async def _gpu_sender(sess):
             # 探针必须在**所有传输路径**下都跑。安全桌面(UAC 同意框 / 锁屏 /
             # Ctrl+Alt+Del)会让每一条路径都拿不到画面:RTP 走的是同一个 DXGI
             # 桌面复制,切桌面时同样 ACCESS_LOST。客户端也都需要那句说明。
-            # 原条件里带了 `not sess.rtp and not sess.rtp_pending and not sess.webrtc`,
-            # 于是 UDP/WebRTC 模式下切到安全桌面时客户端收不到 screen_paused,
+            # 原条件里带了 `not sess.rtp and not sess.rtp_pending`,
+            # 于是 UDP 模式下切到安全桌面时客户端收不到 screen_paused,
             # 画面只是莫名冻住 —— 而手机远程恰恰常用 UDP。
             if sess.streaming:
                 try:
@@ -2075,7 +2110,7 @@ async def _gpu_sender(sess):
     watch_task = asyncio.create_task(_secure_watch())
     try:
         while sess.running:
-            if sess.streaming and _STREAMING and not sess.webrtc and not sess.rtp and not sess.rtp_pending:
+            if sess.streaming and _STREAMING and not sess.rtp and not sess.rtp_pending:
                 if sess._keyframe_request.is_set():
                     sess._keyframe_request.clear()
                     if streamer:
@@ -2118,11 +2153,12 @@ async def _gpu_sender(sess):
                             # instead of ending the stream and making the
                             # client's watchdog reconnect in a loop.
                             continue
-                        await _fallback_to_legacy(sess, "failed to start")
+                        await _pause_stream(sess, "failed to start")
                         return
                     continue
-                if not streamer.alive():
-                    _gpu_dbg(f"streamer dead (rc={streamer._proc.returncode})")
+                _h = session_health(sess)
+                if not _h["alive"]:
+                    _gpu_dbg(f"streamer dead (reason={_h['reason']}, rc={streamer._proc.returncode})")
                     streamer.close()
                     streamer = None
                     sess.tcp_streamer = None
@@ -2134,7 +2170,7 @@ async def _gpu_sender(sess):
                     deaths += 1
                     death_ts = time.monotonic()
                     if deaths >= _GPU_DEATH_RETRIES:
-                        await _fallback_to_legacy(sess, "died")
+                        await _pause_stream(sess, "died")
                         return
                     continue
                 # block until the next encoded frame arrives (the ffmpeg
@@ -2179,20 +2215,19 @@ async def _gpu_sender(sess):
             sess.tcp_streamer = None
 
 
-async def _fallback_to_legacy(sess, reason):
-    # GPU capture lost (UAC / lock screen / session switch).  The old dxcam
-    # legacy pipeline is native-crash-prone here (BEX64 / 0xc0000409 on some
-    # GPU configs — Q470) and cannot capture the secure desktop anyway, so we
-    # do NOT switch to it.  Instead this connection simply stops streaming:
-    # the client's frame-stall watchdog reconnects and retries the GPU path
-    # until capture becomes available again.
-    _gpu_dbg(f"fallback to legacy ({reason})")
+async def _pause_stream(sess, reason):
+    """GPU 采集拿不到画面时**只是暂停推流**，等客户端看门狗重连重试。
+
+    这里从来不会切到别的采集路径（dxcam 软编在某些 GPU 配置上是 native 崩溃源，
+    而且同样抓不到安全桌面）。原来的名字 `_fallback_to_legacy` 有误导性，已改。
+    """
+    _gpu_dbg(f"pause stream ({reason})")
     print(f"  GPU streamer {reason} — pausing stream; client will reconnect")
     await asyncio.sleep(1)
 
 
 async def ws_handler(websocket):
-    """Video channel: H.264 frames + WebRTC negotiation."""
+    """Video channel: H.264 frames (RTP/UDP or TCP)."""
     _set_nodelay(websocket)
     ip = _real_ip(websocket.request.headers, websocket.remote_address[0] if websocket.remote_address else "")
     _audit("WS CONNECT", ip)
@@ -2207,7 +2242,6 @@ async def ws_handler(websocket):
         _pick(lan, "bufsize", "bufsize_lan", "6M", "40M"),
         _cfg.get("ice_servers", []),
     )
-    _webrtc_timeout_task = None
 
     # _ffmpeg_ready() re-checks the file so a just-downloaded ffmpeg is
     # picked up. Every connection re-evaluates the GPU path: when ffmpeg is
@@ -2215,12 +2249,15 @@ async def ws_handler(websocket):
     # pausing, never to the crash-prone dxcam pipeline); when ffmpeg is
     # absent the pure-soft legacy pipeline runs from the start.
     async def screen_sender():
-        if _ffmpeg_ready() and GPUStreamer is not None:
-            _gpu_dbg("sender: GPU path selected")
-            await _gpu_sender(sess)
-        else:
-            _gpu_dbg("sender: legacy path selected")
-            await _legacy_sender(sess)
+        # 只有 GPU 一条路。ffmpeg 缺失时**明确失败**，不再静默降级到
+        # dxcam 软编（那条路自己都标着 native-crash-prone，且需要额外依赖）。
+        if not (_ffmpeg_ready() and GPUStreamer is not None):
+            print("  ERROR: ffmpeg/GPU pipeline unavailable — "
+                  "期望 ffmpeg/ffmpeg.exe 存在且 GPUStreamer 可导入；不推流")
+            _gpu_dbg("sender: GPU path UNAVAILABLE (no fallback)")
+            return
+        _gpu_dbg("sender: GPU path selected")
+        await _gpu_sender(sess)
 
     sender_task = asyncio.create_task(screen_sender())
 
@@ -2237,51 +2274,21 @@ async def ws_handler(websocket):
 
             if cmd == "set_mode":
                 if not msg.get("screen", False):
-                    if sess.webrtc:
-                        await sess.webrtc.close()
-                        sess.webrtc = None
-                    if sess.rtp:
-                        await sess.rtp.close()
-                        sess.rtp = None
+                    await _close_rtp(sess)
                     sess.rtp_pending = False
                 else:
                     fmt = msg.get("format")
                     # 传输方式切换时必须释放另一条路径的资源,否则旧的 RTP
-                    # GPUStreamer 仍占着 DXGI/NVENC,与 TCP/webrtc 新采集冲突。
+                    # GPUStreamer 仍占着 DXGI/NVENC,与 TCP 新采集冲突。
                     if sess.rtp and fmt != "rtp":
-                        await sess.rtp.close()
-                        sess.rtp = None
-                    if sess.webrtc and fmt != "webrtc":
-                        await sess.webrtc.close()
-                        sess.webrtc = None
+                        await _close_rtp(sess)
+                _was_streaming = sess.streaming
                 sess.streaming = msg.get("screen", False)
+                if sess.streaming != _was_streaming:
+                    _keep_awake(sess.streaming)      # 推流→按住电源状态；停推→释放
                 sess.rtp_pending = sess.streaming and msg.get("format") == "rtp" and RTPVideoTransport is not None
-                if sess.streaming and WebRTCSession and msg.get("format") == "webrtc":
-                    async def _webrtc_send(data):
-                        try:
-                            await websocket.send(data)
-                        except Exception:
-                            pass
-                    async def _dc_handler(msg_str):
-                        try:
-                            await asyncio.to_thread(_exec_cmd, json.loads(msg_str))
-                        except Exception:
-                            pass
-                    s = WebRTCSession(_webrtc_send, _dc_handler, sess.ice_servers)
-                    track_fps, _ = _soft_clamp(sess.fps, sess.gop)
-                    s.add_track(capture.capture_screen_raw, track_fps)
-                    offer = await s.create_offer()
-                    sess.webrtc = s
-                    await websocket.send(json.dumps({
-                        "type": "webrtc_offer",
-                        "sdp": offer.sdp,
-                        "sdp_type": offer.type,
-                    }))
-                    _webrtc_timeout_task = asyncio.create_task(_webrtc_timeout(sess))
-                elif sess.streaming and RTPVideoTransport and msg.get("format") == "rtp":
-                    if sess.rtp:
-                        await sess.rtp.close()
-                        sess.rtp = None
+                if sess.streaming and RTPVideoTransport and msg.get("format") == "rtp":
+                    await _close_rtp(sess)
                     # 先等非 RTP sender 让出采集再冷启动:rtp_pending 门控是轮询的
                     # (最多 ~0.5s 后 sender 会自己关 ffmpeg),不等的话两套 ffmpeg
                     # 并抢 NVENC/DXGI,拖慢 first_frame、更容易超客户端协商超时。
@@ -2320,19 +2327,21 @@ async def ws_handler(websocket):
             elif cmd == "rtp_ice":
                 if sess.rtp:
                     await sess.rtp.add_ice(msg["candidate"])
-            elif cmd == "webrtc_answer":
-                if sess.webrtc:
-                    await sess.webrtc.handle_answer(msg["sdp"], msg.get("sdp_type", "answer"))
-            elif cmd == "webrtc_ice":
-                if sess.webrtc:
-                    await sess.webrtc.add_ice(msg["candidate"])
+            elif cmd == "client_log":
+                # 前端上报的低频诊断事件(见 app.js 的 _clog)。写进 gpu_stream_debug
+                # 与采集/编码日志同文件同时间戳 —— 偶发故障时这是唯一能分清
+                # "服务端没发 offer" / "客户端没答" / "ICE 卡住" 的办法。
+                try:
+                    _gpu_dbg(f"client[{ip}]: {msg.get('ev', '')} {msg.get('d', '')}")
+                except Exception:
+                    pass
             elif cmd == "bitrate_adapt":
                 tier = max(0, min(2, int(msg.get("tier", 0))))
                 if tier != sess._bitrate_tier:
                     print(f"  bitrate adapt: tier {sess._bitrate_tier} -> {tier}")
                     sess._bitrate_tier = tier
             elif cmd == "request_keyframe":
-                if sess.streaming and not sess.webrtc:
+                if sess.streaming:
                     sess._keyframe_request.set()
     except websockets.exceptions.ConnectionClosed:
         pass
@@ -2345,12 +2354,11 @@ async def ws_handler(websocket):
             print(f"  release held error: {_e}")
         sess.running = False
         sender_task.cancel()
-        if sess.webrtc:
-            asyncio.ensure_future(sess.webrtc.close())
-        if sess.rtp:
-            asyncio.ensure_future(sess.rtp.close())
-        if _webrtc_timeout_task:
-            _webrtc_timeout_task.cancel()
+        if sess.streaming:
+            sess.streaming = False
+            _keep_awake(False)
+        if sess.rtp or getattr(sess, "rtp_ref", None):
+            asyncio.ensure_future(_close_rtp(sess))
         try:
             await sender_task
         except asyncio.CancelledError:
@@ -2367,7 +2375,7 @@ def _ensure_firewall():
     拷到干净机器上跑时,Windows 会弹"是否允许",用户点了取消就连不进 8770 ——
     现象是"本机自己能用、手机连不上"。
 
-    为什么必须"按程序放行":RTP/WebRTC 的入站 UDP 落在 ICE 协商出的**临时端口**上,
+    为什么必须"按程序放行":RTP/ICE 的入站 UDP 落在协商出的**临时端口**上,
     固定端口规则覆盖不到。
 
     端口取 config.json(与 start.bat / daemon 同一来源),不硬编码。
@@ -2415,17 +2423,32 @@ def _sweep_stray_ffmpeg():
         return
     try:
         import subprocess as _sp
+        # 只杀"归属本服务"的：父进程已退出(孤儿)，或父进程也是 python。
+        # 别的程序(比如 OBS)同样会用 ddagrab，光看命令行会误杀。
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='ffmpeg.exe'\" | "
               "Where-Object { $_.CommandLine -like '*ddagrab*' } | "
-              "ForEach-Object { $_.ProcessId }")
+              "ForEach-Object { "
+              "  $par = Get-CimInstance Win32_Process -Filter (\"ProcessId=\" + $_.ParentProcessId) -ErrorAction SilentlyContinue; "
+              "  ($_.ProcessId.ToString() + ',' + $(if ($par -and $par.Name -notlike 'python*') { 'skip' } else { 'kill' })) "
+              "}")
         out = _sp.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                      capture_output=True, text=True, timeout=20).stdout
+                      capture_output=True, text=True, timeout=25).stdout
         killed = 0
-        for tok in out.split():
-            if not tok.isdigit():
+        skipped = 0
+        for line in out.splitlines():
+            line = line.strip()
+            if "," not in line:
                 continue
-            _sp.run(["taskkill", "/PID", tok, "/F"], capture_output=True, timeout=10)
+            pid_s, action = line.split(",", 1)
+            if not pid_s.isdigit():
+                continue
+            if action.strip() != "kill":
+                skipped += 1
+                continue
+            _sp.run(["taskkill", "/PID", pid_s.strip(), "/F"], capture_output=True, timeout=10)
             killed += 1
+        if skipped:
+            print(f"  skipped {skipped} ffmpeg process(es) owned by another app")
         if killed:
             print(f"  swept {killed} stray ffmpeg process(es) holding ddagrab")
     except Exception as e:
@@ -2450,7 +2473,7 @@ async def main():
 
     # RTP 单包上限(config rtp_mtu,默认 1100;0=保持 aiortc 的 1300)。
     # 目的:避免在 Tailscale/WireGuard(内层 MTU 1220)上每个视频包被 IP 分片。
-    # 进程级生效,启动时打一次即可(同时覆盖 RTP 主路径与 WebRTC 兜底路径)。
+    # 进程级生效,启动时打一次即可(覆盖 RTP 主路径)。
     if apply_packet_mtu is not None:
         try:
             apply_packet_mtu(_cfg.get("rtp_mtu", 1100))
@@ -2459,7 +2482,7 @@ async def main():
 
     if not _STREAMING:
         print("Streaming unavailable — running remote-only mode.")
-        print("  Install for streaming: pip install av numpy dxcam")
+        print("  Install for streaming: pip install av numpy")
 
     if SSL_CERT.is_file() and SSL_KEY.is_file():
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

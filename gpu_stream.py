@@ -462,6 +462,7 @@ class GPUStreamer:
         self.produced_bytes = 0
         self.dropped = 0
         self._proc = None
+        self._last_frame_at = time.monotonic()   # 采集心跳(见 alive)
         self._err_buf = b""
         if need_restart:
             # 软编降规格：释放探测进程，按最终规格重启
@@ -788,6 +789,7 @@ class GPUStreamer:
                 next_nudge = time.monotonic() + 1.2
             try:
                 self._pending = self._q.get(timeout=0.1)
+                self._last_frame_at = time.monotonic()
                 _dbg(f"first_frame: OK after {time.monotonic()-start:.2f}s")
                 return True
             except queue.Empty:
@@ -815,10 +817,18 @@ class GPUStreamer:
                 continue
             if is_idr:
                 self.chain_broken = False
+            self._last_frame_at = time.monotonic()
             return item
 
+    # 采集"活着但不产帧"的判死窗口。ddagrab 在桌面复制失效(休眠/锁屏)后常常
+    # 只是不再产帧:进程在、poll() 仍为 None —— 只看 poll() 的看门狗发现不了。
+    # 实测就是这样漏掉了一个 25 Mbps 空转的孤儿,最后 ddagrab 被占满、整链路瘫痪。
+    ALIVE_NOFRAME_S = 5.0
+
     def alive(self):
-        return self._proc.poll() is None
+        if self._proc.poll() is not None:
+            return False
+        return (time.monotonic() - self._last_frame_at) <= self.ALIVE_NOFRAME_S
 
     def close(self):
         self._stop.set()

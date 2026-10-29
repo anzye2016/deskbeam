@@ -64,10 +64,26 @@ function Ensure-Firewall {
     # 需要用别的来源(其它 VPN/公网直连)时,把它的网段加进 $allow。
     # 计划任务以 RunLevel=Highest 运行,所以这些调用有权限。
     $allow = @('LocalSubnet', '100.64.0.0/10', 'fd7a:115c:a1e0::/48')
+    # `.venv\Scripts\python.exe` 只是 launcher(见 Start-Process 前的注释):真正
+    # 持有 socket 的是 pyvenv.cfg 里 home 指向的解释器。程序级入站规则**只按 exe
+    # 路径匹配**,只放行 launcher 时 ICE 的入站 UDP 会被拦 —— 现象就是"握手成功、
+    # 一帧不走"(服务端 stats fps=0、qsize 满,客户端每 3s 重来)。
+    $realPy = $null
+    $cfgFile = Join-Path $PSScriptRoot '.venv\pyvenv.cfg'
+    if (Test-Path $cfgFile) {
+        $homeLine = Get-Content $cfgFile | Where-Object { $_ -match '^\s*home\s*=' } | Select-Object -First 1
+        if ($homeLine) {
+            $cand = Join-Path (($homeLine -replace '^\s*home\s*=\s*', '').Trim()) 'python.exe'
+            if (Test-Path $cand) { $realPy = $cand }
+        }
+    }
     $spec = @(
         @{ n = "$ruleTag-$port";  kind = 'port'; desc = "TCP $port (web/signalling)" },
         @{ n = "$ruleTag-python"; kind = 'prog'; desc = "program allow (RTP ephemeral ports)" }
     )
+    if ($realPy) {
+        $spec += @{ n = "$ruleTag-python-real"; kind = 'prog'; p = $realPy; desc = "real interpreter allow (RTP ephemeral ports)" }
+    }
     foreach ($r in $spec) {
         try {
             $existing = Get-NetFirewallRule -DisplayName $r.n -ErrorAction SilentlyContinue
@@ -80,8 +96,9 @@ function Ensure-Firewall {
                 New-NetFirewallRule -DisplayName $r.n -Direction Inbound -Action Allow `
                     -Protocol TCP -LocalPort $port -RemoteAddress $allow -Profile Any | Out-Null
             } else {
+                $prog = if ($r.p) { $r.p } else { $exe }
                 New-NetFirewallRule -DisplayName $r.n -Direction Inbound -Action Allow `
-                    -Program $exe -RemoteAddress $allow -Profile Any | Out-Null
+                    -Program $prog -RemoteAddress $allow -Profile Any | Out-Null
             }
             Log "[deskbeam] firewall: added inbound allow $($r.n) ($($r.desc))"
         } catch {
