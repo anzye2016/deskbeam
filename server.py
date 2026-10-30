@@ -1829,6 +1829,12 @@ async def _rtp_wait_capture(sess, websocket):
         backoff = min(8.0, backoff * 2)
         if sess.rtp:                        # 客户端自己已经恢复成功,别重复起
             return
+        if not sess.streaming:
+            # 已经切走(REMOTE 模式)或用户关了画面:别再试。
+            # 原来只看 sess.running —— 一次 RTP 启动失败后切到 REMOTE,这里会
+            # 每 8 秒永远重启采集(空转)。下次 set_mode{screen:true} 会重新创建
+            # 这个任务,所以直接 return 是安全的。
+            return
         if getattr(sess, "secure_paused", False):
             continue                        # 安全桌面期间重启用不了
         transport = None
@@ -1849,49 +1855,27 @@ async def _rtp_wait_capture(sess, websocket):
             return
 
 
-_ES_CONTINUOUS = 0x80000000
-_ES_SYSTEM_REQUIRED = 0x00000001
-_ES_DISPLAY_REQUIRED = 0x00000002
-_awake_n = 0
+def _wake_display():
+    """串流开始时把显示器戳醒（一次 1px 相对移动 = 输入事件）。
 
+    远程用时本机显示器常常已经休眠，而 **DXGI 桌面复制在休眠状态下拿不到帧** ——
+    ddagrab 打开成功、first_frame 也 OK，但 fps 恒为 0、客户端 13s 后判协商失败。
 
-def _keep_awake(on):
-    """推流期间按住显示器/系统电源状态（计数器，支持多会话）。
-
-    DXGI 桌面复制在屏幕休眠(或锁屏)后会 ACCESS_LOST —— ddagrab 报 887a0026，
-    ffmpeg 虽然起来了但 fps=0、一帧都拿不到，表现就是"连上了没画面"，
-    而且唤醒屏幕前怎么重启采集都没用（实测 21 次 ACCESS_LOST、本机显示器
-    5 分钟就关、powercfg /requests 一直是空的）。
-
-    远程串流时本机屏幕本来就是黑着的，所以必须由服务端主动按住。代价是
-    串流期间屏幕保持点亮；不想亮屏只能接 EDID 假负载/虚拟显示器。
+    **不做持续抑制**（曾经用 ES_DISPLAY_REQUIRED 按住，已撤）：
+      * 串流时你本来就在操作键鼠，每次输入都会把息屏推迟一个超时周期
+      * 播放器等需要常亮的程序自己会 hold 电源请求
+      * 而持续抑制的副作用是：手机一放、浏览器留在前台，本机屏幕就**无限亮着**
+    所以这里只做"戳一下"，之后交给系统正常息屏策略。
     """
-    global _awake_n
     if sys.platform != "win32":
         return
     try:
         import ctypes
-        prev = _awake_n
-        _awake_n = max(0, _awake_n + (1 if on else -1))
-        if prev == 0 and _awake_n > 0:
-            ctypes.windll.kernel32.SetThreadExecutionState(
-                _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED)
-            # 只"按住电源状态"能防止**将来**休眠，但**唤不醒已经睡着的显示器**。
-            # 远程用时屏幕多半已经黑了 —— 推流开始必须主动戳一下(1px 相对移动再回来)，
-            # 否则 ddagrab 拿不到帧、fps=0、客户端 13s 后判协商失败(实测就是
-            # "切 GYRO 再开 video 一直没画面")。光标抖动 1px 无感。
-            try:
-                _u = ctypes.windll.user32
-                _u.mouse_event(0x0001, 1, 0, 0, 0)    # MOUSEEVENTF_MOVE, +1px
-                _u.mouse_event(0x0001, -1, 0, 0, 0)   # 移回来
-            except Exception:
-                pass
-            print("  display sleep inhibited (streaming)")
-        elif prev > 0 and _awake_n == 0:
-            ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
-            print("  display sleep inhibition released")
+        _u = ctypes.windll.user32
+        _u.mouse_event(0x0001, 1, 0, 0, 0)    # MOUSEEVENTF_MOVE, +1px
+        _u.mouse_event(0x0001, -1, 0, 0, 0)   # 移回来
     except Exception as e:
-        print(f"  keep-awake failed: {e!r}")
+        print(f"  wake-display failed: {e!r}")
 
 
 async def _close_rtp(sess):
@@ -2284,8 +2268,8 @@ async def ws_handler(websocket):
                         await _close_rtp(sess)
                 _was_streaming = sess.streaming
                 sess.streaming = msg.get("screen", False)
-                if sess.streaming != _was_streaming:
-                    _keep_awake(sess.streaming)      # 推流→按住电源状态；停推→释放
+                if sess.streaming and not _was_streaming:
+                    _wake_display()      # 刚开始推流：把可能已休眠的显示器戳醒
                 sess.rtp_pending = sess.streaming and msg.get("format") == "rtp" and RTPVideoTransport is not None
                 if sess.streaming and RTPVideoTransport and msg.get("format") == "rtp":
                     await _close_rtp(sess)
@@ -2354,9 +2338,7 @@ async def ws_handler(websocket):
             print(f"  release held error: {_e}")
         sess.running = False
         sender_task.cancel()
-        if sess.streaming:
-            sess.streaming = False
-            _keep_awake(False)
+        # 不再持有电源请求，断开时无需释放
         if sess.rtp or getattr(sess, "rtp_ref", None):
             asyncio.ensure_future(_close_rtp(sess))
         try:
