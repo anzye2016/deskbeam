@@ -115,8 +115,65 @@ if _IS_WIN:
         finally:
             _user32.CloseDesktop(h)
 
+
     def input_desktop_name():
         return _input_desktop_state()[0]
+
+    def _uac_or_lockscreen_running():
+        """consent.exe(UAC 提权框) 或 LogonUI.exe(锁屏) 是否在运行。
+
+        **这是权威信号**:UAC 提权框由 consent.exe 托管,锁屏由 LogonUI.exe 托管,
+        两者都只在对应界面显示期间存在。相比 OpenInputDesktop,它不受进程完整性
+        级别影响(实测 2026-11-07:High 完整性的服务进程调用 OpenInputDesktop 会
+        时好时坏,同一秒内 name="Default"/err=0 与 name=None/err=5 交替),
+        也不会被"安全桌面是另一个桌面、GetForegroundWindow 拿不到"影响。
+
+        用 CreateToolhelp32Snapshot 枚举进程名,约 2ms。
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            TH32CS_SNAPPROCESS = 0x2
+            INVALID = ctypes.c_void_p(-1).value
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260),
+                ]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if not snap or snap == INVALID:
+                return False
+            try:
+                ent = PROCESSENTRY32W()
+                ent.dwSize = ctypes.sizeof(ent)
+                if not k32.Process32FirstW(snap, ctypes.byref(ent)):
+                    return False
+                while True:
+                    if ent.szExeFile.lower() in ("consent.exe", "logonui.exe"):
+                        return True
+                    if not k32.Process32NextW(snap, ctypes.byref(ent)):
+                        break
+                return False
+            finally:
+                k32.CloseHandle(snap)
+        except Exception:
+            return False
 
     def is_secure_desktop():
         """True while UAC / the lock screen / a secure desktop owns the screen.
@@ -127,10 +184,15 @@ if _IS_WIN:
         denied the secure desktop rather than shown its name, so the denial
         itself is the signal. A desktop that does open as something other
         than "Default" counts too. A missing API never reports secure."""
+        # 常态路径(占 99% 的调用):能拿到桌面名字,直接按名字判定 —— 约 0.05ms。
         name, err = _input_desktop_state()
         if name is not None:
             return name != "Default"
-        return err == 5  # ERROR_ACCESS_DENIED
+        # 拿不到名字时才做进程枚举(约 5.7ms,只在"真 UAC"或"偶发误判"时走到)。
+        # UAC 提权框由 consent.exe 托管、锁屏由 LogonUI.exe 托管,两者都只在对应
+        # 界面显示期间存在 —— 这是权威信号,不受进程完整性级别影响。
+        # (High 完整性下 OpenInputDesktop 会时好时坏,见该函数说明。)
+        return _uac_or_lockscreen_running()
 
 else:
     from Xlib import X as _X

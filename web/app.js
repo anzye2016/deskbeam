@@ -42,6 +42,14 @@ function _clog(ev,extra){
       wsV.send(JSON.stringify({type:'client_log',ev:ev,d:(extra===undefined?'':String(extra))}));
   }catch(_){}
 }
+/* 每次主动关 WS 都记原因 —— 频繁重连会让服务端每来一个新会话就重新判一次安全桌面，
+   形成"重连→误判→screen_paused→再重连"的循环，必须知道是谁在关。 */
+function _logClose(why){_clog('ws_close',why+' paused='+_paused+' noSig='+_noSig+' frames='+_frameN);}
+var _frameN=0;
+setInterval(function(){
+  if(!(_so||_gm))return;
+  _clog('frames','n='+_frameN+' paused='+_paused+' noSig='+_noSig+' rtpMode='+_rtpMode+' vdSrc='+!!(document.getElementById('vd')&&document.getElementById('vd').srcObject));
+},5000);
 function _focusTouch(){
   var id = (typeof _gm!=='undefined' && _gm && document.getElementById('gta')) ? 'gta' : 'ta';
   setTimeout(function(){
@@ -920,7 +928,13 @@ function cnV(){
   var p=location.protocol==='https:'?'wss':'ws';
   wsV=new WebSocket(p+'://'+location.host+_BASE+'/ws');
   wsV.binaryType='arraybuffer';
-  wsV.onopen=function(){_setPaused(false);if(_so||_gm)sm(true);};
+  wsV.onopen=function(){
+    /* 重连后把两种覆盖提示都清掉。以前只清 _paused，如果卡的是
+       "未检测到活动显示输出"(_noSig)，重连不会收掉它。 */
+    _setPaused(false);_setNoSignal(false);
+    _clog('hello','appjs='+APPJS_VER);
+    if(_so||_gm)sm(true);
+  };
   wsV.onclose=function(){_reconOrLogin('vid',cnV);};
   wsV.onerror=function(){};
   wsV.onmessage=function(e){
@@ -1023,6 +1037,9 @@ function cnV(){
    服务端把已 NVENC 编码的 H.264 通过标准 RTP 视频轨发来,浏览器用
    RTCRtpReceiver 接收,由浏览器原生 <video> 解码播放。丢包由浏览器原生
    NACK/PLI 处理,无需自建协议。信令(offer/answer/ICE)复用 /ws。 */
+/* 前端版本标记：只为排查"你加载的是哪一版 app.js"。改前端就 +1。
+   WS 连上时上报一次，服务端写进 gpu_stream_debug.txt。 */
+var APPJS_VER='2026-11-07.4';
 var _rtpMode=false,_rtpRetry=0,_rtpTimer=null;
 /* 当前 RTP 会话的合成流(音视频轨并进同一条,见 pc.ontrack)。
    进出 GYRO 靠 _attachStream 把它改挂到另一个 <video>,而不是重新协商。 */
@@ -1044,6 +1061,13 @@ function _rtpRecv(m){
     return;
   }
   if(_rtpTimer){clearTimeout(_rtpTimer);_rtpTimer=null;}
+  /* 新 offer = 服务端已经起来了，桌面这一刻是活的。
+     清掉可能从上一个会话残留的"已暂停/无活动显示输出"提示：
+     服务端只在 **状态发生变化** 时发 screen_paused/resumed，新会话的
+     secure_last 初始就是 False，所以 UAC 结束后重连不会补发 screen_resumed，
+     客户端的 _paused 就会一直挂着（实测:UAC 确认后画面正常、提示页不消失）。 */
+  _setPaused(false);
+  _setNoSignal(false);
   try{if(_pc){_pc.close();}}catch(_){}
   // RTP 画面由 <video> 渲染,screen_config 触发的 WebCodecs 解码器用不上,
   // 关掉省资源(不影响 _rw/_rh 坐标映射,它们已在 _setupDecoder 里设好)。
@@ -1099,6 +1123,12 @@ function _rtpRecv(m){
       var _rfTick=function(now){
         if(!_rtpMode)return;
         _lastFrameAt=now;  // 帧停滞看门狗也覆盖 RTP 模式(否则误判无帧频繁重连)
+        /* 收到帧 = 桌面已经回来了。清掉可能滞留的"已暂停/无活动显示输出"提示:
+           服务端的 screen_resumed 偶尔会丢(采样被 gating、状态卡住等),而画面
+           明明在动 —— 不能因为一条通知没到就一直挂着提示页。 */
+        _frameN=(typeof _frameN==='number'?_frameN:0)+1;
+        if(_paused)_setPaused(false);
+        if(_noSig)_setNoSignal(false);
         if(!_rfStart){_rfStart=now;}
         _rfCount++;
         if(now-_rfLast>500){
@@ -1110,6 +1140,8 @@ function _rtpRecv(m){
         tv.requestVideoFrameCallback(_rfTick);
       };
       tv.requestVideoFrameCallback(_rfTick);
+    }else{
+      _clog('novfc','requestVideoFrameCallback 不可用');
     }
     // RTP 模式若未收到 screen_config(兜底),从视频实际尺寸初始化坐标映射
     // (_rw/_rh 客户端显示尺寸,_rwr/_rhr 远程桌面原生分辨率)。
@@ -1136,11 +1168,11 @@ function _rtpRecv(m){
     if(pc!==_pc)return;
     if(s==='failed'){
       if(!_rtpMode)return;
-      if(wsV&&wsV.readyState===WebSocket.OPEN)wsV.close();
+      if(wsV&&wsV.readyState===WebSocket.OPEN){_logClose('ice_'+s);wsV.close();}
     }else if(s==='disconnected'){
       if(!_rtpMode)return;
       if(_rtpTimer){clearTimeout(_rtpTimer);}
-      _rtpTimer=setTimeout(function(){_rtpTimer=null;if(_rtpMode&&wsV&&wsV.readyState===WebSocket.OPEN)wsV.close();},3000);
+      _rtpTimer=setTimeout(function(){_rtpTimer=null;if(_rtpMode&&wsV&&wsV.readyState===WebSocket.OPEN){_logClose('ice_disconnected_3s');wsV.close();}},3000);
     }else if(s==='connected'||s==='completed'){
       if(_rtpTimer){clearTimeout(_rtpTimer);_rtpTimer=null;}
     }
@@ -1251,7 +1283,7 @@ function _latMeasure(seq){
       _latLastRefresh=now+_LAT_COOLDOWN-cd; /* 借用冷却比较,等效延长 */
       _latCooldownUntil=now+cd;
       _latOver=null;_latReset();
-      if(wsV)wsV.close();
+      if(wsV){_logClose('lat_over');wsV.close();}
     }
   }else{
     _latOver=null;
@@ -1417,8 +1449,12 @@ var _NEGO_MS=13000;
 /* 安全桌面(UAC / 锁屏)提示:服务端看到输入桌面切成 Winlogon 就下发
    screen_paused——此时采集根本不可能成功,重连也是白连,所以暂停期间直接
    禁用下面的停滞看门狗,画面停在最后一帧并叠一行文字说明"不是真卡"。 */
-var _paused=false;
+var _paused=false,_pausedRenew=0;
 function _setPaused(on){
+  /* 服务端在安全桌面期间每 3s 续期一次(见 server.py::_secure_watch)。
+     8s 没续期就自动清 —— 服务端判定偶发误判(High 完整性下 OpenInputDesktop
+     时好时坏)时,提示不会永久卡住,不需要刷新页面。 */
+  if(on)_pausedRenew=performance.now();
   if(_paused===on)return;
   _paused=on;
   var el=document.getElementById('pmsg');
@@ -1515,6 +1551,15 @@ function _recoverMedia(){
     }
   }catch(e){console.error('recoverMedia:',e);}
 }
+setInterval(function(){
+  if(_paused&&performance.now()-_pausedRenew>8000){
+    /* 服务端在安全桌面期间每 3s 续期一次。8s 没续期就自动清 —— 服务端判定
+       偶发误判时提示不会永久卡住,不需要刷新页面。恢复画面交给帧停滞看门狗。 */
+    console.warn('screen_paused expired (no renewal in 8s)');
+    _clog('paused_expired','no renewal 8s');
+    _setPaused(false);
+  }
+},1000);
 function _frameStall(){
   /* 安全桌面(_paused)与「无活动显示输出」(_noSig)期间采集根本不可能成功，
      重建/重连都是白跑 —— 而且会在每个 GOP 上反复撞 NVENC。恢复交给服务端补发的
@@ -1541,7 +1586,7 @@ function _frameStall(){
   /* 第二阶段:媒体重建也没救回来,才判定为会话级故障,重连。 */
   _stallStage=2;
   console.warn('frame stall: media rebuild failed, reconnecting session');
-  if(wsV)wsV.close();
+  if(wsV){_logClose('stall_stage2');wsV.close();}
 }
 setInterval(_frameStall,1000);
 /* ── 码率分档:判据用 RTT,不再用 _lat。_lat 靠帧间隔外推、会漂移,拿它当

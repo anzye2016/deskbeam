@@ -1836,7 +1836,15 @@ async def _rtp_wait_capture(sess, websocket):
             # 这个任务,所以直接 return 是安全的。
             return
         if getattr(sess, "secure_paused", False):
-            continue                        # 安全桌面期间重启用不了
+            # 安全桌面期间重启必然失败 —— 但不能**永远**不试:一旦这个标志卡住
+            # (实测 2026-11-07:High 完整性的进程 OpenInputDesktop 时好时坏,导致
+            # secure_paused 一直 True),采集就再也不会被拉起来,客户端也没有帧
+            # 可以拿来清"已暂停"提示,只能刷新页面。所以每 10 秒仍强试一次。
+            _now_s = time.monotonic()
+            if _now_s - globals().setdefault("_last_secure_try", 0.0) < 10.0:
+                continue
+            globals()["_last_secure_try"] = _now_s
+            _gpu_dbg("secure_paused stuck? forcing one restart attempt")
         transport = None
         try:
             sess.rtp_pending = True
@@ -2068,6 +2076,11 @@ async def _gpu_sender(sess):
 
     async def _secure_watch():
         nonlocal secure_last
+        # 交叉验证用的帧计数:安全桌面下 ddagrab 抓不到任何东西,所以
+        # **只要还在出帧,就绝不可能是安全桌面**。
+        _last_prod = -1
+        _last_prod_ts = 0.0
+        _last_paused_send = 0.0
         while sess.running and not closing.is_set():
             # 探针必须在**所有传输路径**下都跑。安全桌面(UAC 同意框 / 锁屏 /
             # Ctrl+Alt+Del)会让每一条路径都拿不到画面:RTP 走的是同一个 DXGI
@@ -2075,15 +2088,64 @@ async def _gpu_sender(sess):
             # 原条件里带了 `not sess.rtp and not sess.rtp_pending`,
             # 于是 UDP 模式下切到安全桌面时客户端收不到 screen_paused,
             # 画面只是莫名冻住 —— 而手机远程恰恰常用 UDP。
-            if sess.streaming:
+            # **无条件**采样:原来这行是 `if sess.streaming:`，一旦流停(REMOTE 切换、
+            # set_mode{screen:false}、甚至 UAC 期间客户端看门狗重连)就不再更新
+            # secure_last / secure_paused —— UAC 结束后状态卡在 True，客户端一直停在
+            # "已暂停"提示页，只能刷新恢复(实测连续 4 条 entered、一条 left 都没有)。
+            # 采样只是 OpenInputDesktop + GetUserObjectInformation，0.5s 一次可忽略；
+            # 发送仍只在状态变化时发生。
+            if True:    # 无条件采样(见上)
                 try:
                     secure = is_secure_desktop()
+                    # 诊断只记**变化**:每 0.5s 一条会把日志刷爆(实测一天几十 MB)。
+                    # 只在判定结果变化时记一行,足够回溯那次误判。
+                    try:
+                        from platform_api import _input_desktop_state as _ids
+                        _nm, _er = _ids()
+                        _sig = (str(_nm), _er, bool(secure))
+                        if _sig != globals().get("_last_probe_sig"):
+                            globals()["_last_probe_sig"] = _sig
+                            _gpu_dbg(f"secure probe: name={_nm!r} err={_er} -> secure={secure}")
+                    except Exception:
+                        pass
                 except Exception:
                     secure = False
-                if secure != secure_last:
+                # 交叉验证:安全桌面下 ddagrab 抓不到任何东西,所以**只要还在出帧,
+                # 就绝不可能是安全桌面**。
+                # 背景:服务进程是 High 完整性(exe 标了 High),此时 OpenInputDesktop
+                # 可能返回 ERROR_ACCESS_DENIED(5),而现有实现把这个拒绝当成"安全
+                # 桌面" —— 于是每个新会话第一条采样就判 True,客户端永远停在
+                # "已暂停"(实测:UAC 结束后 entered 不再有 left,而 stats 显示
+                # fps=55 正常出帧,现场探 is_secure_desktop() 却是 False)。
+                try:
+                    _st = sess.pipeline.streamer()
+                    _prod = getattr(_st, "produced", None) if _st is not None else None
+                    if _prod is not None and secure:
+                        _now2 = time.monotonic()
+                        if _prod != _last_prod:
+                            _last_prod = _prod
+                            _last_prod_ts = _now2
+                        # 注意必须是独立的 if,不能是 elif:帧在流时 _prod 每 0.5s
+                        # 都在变,走 if 分支后就永远到不了 elif —— 那样交叉验证只在
+                        # "帧停了"时才生效,而我们要的恰恰是"帧在流 ⇒ 不是安全桌面"。
+                        if _now2 - _last_prod_ts < 1.5:
+                            _gpu_dbg("secure desktop: overridden by live frames "
+                                     f"(produced={_prod})")
+                            secure = False
+                except Exception:
+                    pass
+                # 状态变化时发一次;之后**安全桌面期间每 3s 重发一次**(续期)。
+                # 客户端把它做成"8s 不续期就自动清" —— 否则服务端一旦在"采集重启
+                # 空窗"里误判一次(此时没有帧可以推翻判定),提示就永久卡住,
+                # 只能刷新页面(实测 2026-11-07)。
+                _chg = secure != secure_last
+                _now3 = time.monotonic()
+                if _chg:
                     secure_last = secure
                     sess.secure_paused = secure
                     _gpu_dbg("secure desktop: " + ("entered" if secure else "left"))
+                if _chg or (secure and _now3 - _last_paused_send >= 3.0):
+                    _last_paused_send = _now3
                     try:
                         await sess.ws.send(json.dumps({
                             "type": "screen_paused" if secure else "screen_resumed"}))
@@ -2208,6 +2270,7 @@ async def _pause_stream(sess, reason):
     _gpu_dbg(f"pause stream ({reason})")
     print(f"  GPU streamer {reason} — pausing stream; client will reconnect")
     await asyncio.sleep(1)
+
 
 
 async def ws_handler(websocket):
