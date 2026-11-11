@@ -27,7 +27,7 @@
     "wan_width": 0,
     "wan_height": 0,
     "streaming": true,
-    "ffmpeg_url": "",
+    "ffmpeg_url": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
     "asr_local_enabled": true,
     "asr_local_url": "",
     "asr_local_format": "json",

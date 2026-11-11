@@ -118,6 +118,7 @@ def ensure_ffmpeg(url=None, timeout=900):
         return False
     target = _FFMPEG_CANDIDATES[-1]  # writable: exe dir (frozen) / script dir (dev)
     tmp = target + ".tmp"
+    tmp2 = target + ".tmp2"
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         _dbg(f"downloading ffmpeg -> {target}")
@@ -128,6 +129,21 @@ def ensure_ffmpeg(url=None, timeout=900):
                 if not chunk:
                     break
                 f.write(chunk)
+        # 官方/主流 Windows 构建都是 zip（没有单文件下载地址），所以下载到的
+        # 可能是个压缩包：取出里面的 */bin/ffmpeg.exe 替换掉 zip 本体。
+        with open(tmp, "rb") as fh:
+            _magic = fh.read(2)
+        if _magic == b"PK":
+            import zipfile
+            _dbg("downloaded file is a zip, extracting bin/ffmpeg.exe")
+            with zipfile.ZipFile(tmp) as z:
+                _member = next((n for n in z.namelist()
+                                if n.lower().replace("\\", "/").endswith("bin/ffmpeg.exe")), None)
+                if not _member:
+                    raise RuntimeError("zip has no bin/ffmpeg.exe")
+                with z.open(_member) as src, open(tmp2, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+            os.replace(tmp2, tmp)
         if not _IS_WIN:
             os.chmod(tmp, 0o755)
         if _verify_ffmpeg(tmp):
@@ -138,11 +154,12 @@ def ensure_ffmpeg(url=None, timeout=900):
     except Exception as e:
         _dbg(f"ffmpeg download failed: {e!r}")
     finally:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
+        for _p in (tmp, tmp2):
+            try:
+                if os.path.exists(_p):
+                    os.remove(_p)
+            except Exception:
+                pass
     return ffmpeg_ready()
 
 
