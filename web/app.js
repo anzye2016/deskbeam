@@ -2062,12 +2062,19 @@ function _bindHoldEl(el,dcmd,ucmd,nocancel,norepeat){
     if(nocancel&&!inScrollNow())return;   /* 滚动容器里即使 nc:true 也要能取消 */
     var t=_tid(e.touches);
     if(t.identifier!==sTid)return;
-    if(Math.abs(t.clientX-sx)>10||Math.abs(t.clientY-sy)>10){
+    if(Math.abs(t.clientX-sx)>14||Math.abs(t.clientY-sy)>14){
       sl=true; cancelAll();
     }
   };
   var up=function(e){
     if(e.type==='touchend'&&sl)return;
+    /* 同 _tapEl:滚动容器里 touchmove 可能收不到,必须在 touchend 用最终坐标
+       再判一次位移,否则横向滑过按钮会下发 key_down(实测:滑快捷键栏时
+       按住 ESC 滑动,UAC 直接被取消)。 */
+    if(e.type==='touchend'&&e.changedTouches&&e.changedTouches.length){
+      var _u=e.changedTouches[0];
+      if(Math.abs(_u.clientX-sx)>14||Math.abs(_u.clientY-sy)>14){sl=true;cancelAll();return;}
+    }
     e.preventDefault();sTid=-1;
     if(!pr){rem();return;}
     pr=false;
@@ -2093,9 +2100,19 @@ function _tapEl(el,fn,nocancel){if(!el)return;
   var add=function(){el.classList.add('pressed');};
   var rem=function(){el.classList.remove('pressed');};
   var _tid=function(ts){var t;for(var i=0;i<ts.length;i++)if(ts[i].identifier===sTid){t=ts[i];break;}return t||ts[0];};
+  /* 滑动防误触阈值(px)。10 太小:手指在电容屏上抖动/慢速滑动起手时
+     80ms 内位移常常不到 10px,于是 touchend 照样触发(实测 UAC 被 ESC 取消)。 */
+  var SLOP=14;
   var f=function(e){
     if(e.type==='touchstart'){
       var t=e.changedTouches[0];sx=t.clientX;sy=t.clientY;sTid=t.identifier;sl=false;add();return;
+    }
+    if(e.type==='touchcancel'){sl=true;rem();return;}
+    /* **不依赖 touchmove**:滚动容器里浏览器可能把 touchmove 交给滚动,
+       元素收不到,sl 一直是 false —— 所以必须在 touchend 用最终坐标再判一次。 */
+    if(e.changedTouches&&e.changedTouches.length){
+      var u=e.changedTouches[0];
+      if(Math.abs(u.clientX-sx)>SLOP||Math.abs(u.clientY-sy)>SLOP)sl=true;
     }
     if(sl){rem();return;}
     e.preventDefault();rem();fn.call(el);_focusTouch();
@@ -2111,6 +2128,7 @@ function _tapEl(el,fn,nocancel){if(!el)return;
   el.addEventListener('touchstart',f,{passive:true});
   el.addEventListener('touchmove',mv,{passive:true});
   el.addEventListener('touchend',f,{passive:false});
+  el.addEventListener('touchcancel',f);
 }
 var sn=document.getElementById('sn'),rc=document.getElementById('rc'),rr=document.getElementById('rr');
 sn.addEventListener('click',function(){
@@ -2765,25 +2783,61 @@ _initBtnRows();
    固件对 hid_key 的处理是「按下 → 50ms → 释放」,没有真正的按住;ESP 官方网页的做法
    就是定时重发(参考 esp-macro/server/web/index.html 的 setInterval(...,80))。
    得到的是系统自动重复(typematic),对方向键/空格这类导航键够用。 */
+/* ESP 按钮的滑动防误触（与普通页 `_bindHoldEl` 同一套语义）。
+   把"按下即发 HID"改成"延迟 80ms 发，期间位移超 14px 就取消"：
+   横向滑动快捷键栏时手指必然先按下再划走，原本每滑一次就误按一次
+   （实测：切 ESP 模式后滑动快捷键栏，按住 ESC 滑走，UAC 直接被取消）。
+   快速点击在 up 时补发一次，所以手感不变。 */
+var ESP_SLOP = 14;
+function _espGuard(b, fire, stopFn, repeatMs){
+  var sx=0, sy=0, pr=false, fired=false, pend=null, iv=null, sl=false, tid=null;
+  var add=function(){b.classList.add('pressed');};
+  var rem=function(){b.classList.remove('pressed');};
+  var go=function(){
+    if(fired)return;
+    fired=true; pr=true; add(); fire();
+    if(repeatMs){iv=setInterval(fire, repeatMs);}
+  };
+  var cancelAll=function(){
+    if(pend){clearTimeout(pend);pend=null;}
+    if(iv){clearInterval(iv);iv=null;}
+    if(fired){fired=false;}
+    pr=false; rem();
+  };
+  var moved=function(x,y){return Math.abs(x-sx)>ESP_SLOP||Math.abs(y-sy)>ESP_SLOP;};
+  var start=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(pr)return;
+    sx=e.clientX; sy=e.clientY; sl=false;
+    add(); pend=setTimeout(function(){pend=null;go();},80);
+  };
+  var move=function(e){
+    if(sl||!pend)return;
+    if(moved(e.clientX,e.clientY)){sl=true;cancelAll();}
+  };
+  var up=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    /* touchmove 可能被滚动吃掉 —— 用最终坐标再判一次 */
+    if(e&&e.clientX!==undefined&&moved(e.clientX,e.clientY)){sl=true;cancelAll();return;}
+    if(sl){return;}
+    if(pend){clearTimeout(pend);pend=null;go();}   /* 快速点击：补发一次 */
+    cancelAll();
+    if(stopFn)stopFn();
+  };
+  /* pointercancel/pointerleave 是"手势被打断"(页面滚动抢走指针等),
+     绝不能当成点击 —— 只取消 + 释放,不发。 */
+  var ab=function(){ if(pend){clearTimeout(pend);pend=null;} sl=true; cancelAll(); if(stopFn)stopFn(); };
+  b.addEventListener('pointerdown',start);
+  b.addEventListener('pointermove',move);
+  b.addEventListener('pointerup',up);
+  b.addEventListener('pointercancel',ab);
+  b.addEventListener('pointerleave',ab);
+}
+
 function _mkEspHold(spec){
   var b=document.createElement('button');
   b.className='k'; b.textContent=spec.t;
-  var iv=null;
-  var stop=function(){
-    if(iv){clearInterval(iv);iv=null;}
-    b.classList.remove('pressed');
-  };
-  var start=function(e){
-    if(e&&e.cancelable)e.preventDefault();
-    if(iv)return;
-    b.classList.add('pressed');
-    _espHid(spec.key);
-    iv=setInterval(function(){_espHid(spec.key);},80);
-  };
-  b.addEventListener('pointerdown',start);
-  b.addEventListener('pointerup',stop);
-  b.addEventListener('pointercancel',stop);
-  b.addEventListener('pointerleave',stop);
+  _espGuard(b, function(){_espHid(spec.key);}, null, 80);
   return b;
 }
 
@@ -2852,19 +2906,7 @@ function _bindSpaceHold(el){
 function _mkEspRepeat(spec){
   var b=document.createElement('button');
   b.className='k'; b.textContent=spec.t;
-  var iv=null;
-  var stop=function(){ if(iv){clearInterval(iv);iv=null;} b.classList.remove('pressed'); };
-  var start=function(e){
-    if(e&&e.cancelable)e.preventDefault();
-    if(iv)return;
-    b.classList.add('pressed');
-    spec.fire();
-    iv=setInterval(spec.fire,80);
-  };
-  b.addEventListener('pointerdown',start);
-  b.addEventListener('pointerup',stop);
-  b.addEventListener('pointercancel',stop);
-  b.addEventListener('pointerleave',stop);
+  _espGuard(b, spec.fire, null, 80);
   return b;
 }
 
@@ -2889,21 +2931,11 @@ function _espReleaseHolds(){
 function _mkEspBtnHold(spec){
   var b=document.createElement('button');
   b.className='k'; b.textContent=spec.t;
-  var pr=false;
-  var start=function(e){
-    if(e&&e.cancelable)e.preventDefault();
-    if(pr)return; pr=true; b.classList.add('pressed');
-    _espBtnHold(spec.espBtnHold,true);
-  };
-  var stop=function(e){
-    if(e&&e.cancelable)e.preventDefault();
-    if(!pr)return; pr=false; b.classList.remove('pressed');
-    _espBtnHold(spec.espBtnHold,false);
-  };
-  b.addEventListener('pointerdown',start);
-  b.addEventListener('pointerup',stop);
-  b.addEventListener('pointercancel',stop);
-  b.addEventListener('pointerleave',stop);
+  var _down=false;
+  _espGuard(b,
+    function(){ _down=true; _espBtnHold(spec.espBtnHold,true); },
+    function(){ if(_down){_down=false; _espBtnHold(spec.espBtnHold,false);} },
+    0);
   return b;
 }
 
