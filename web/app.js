@@ -2042,9 +2042,16 @@ function _bindHoldEl(el,dcmd,ucmd,nocancel,norepeat){
     if(fired){fired=false;su();}
     pr=false; rem();
   };
+  /* **静止计时**:在滚动容器里,固定 80ms 延迟对慢速滑动无效(手指按下去慢慢划,
+     80ms 时还在按钮上就已经发出去了)。改成"每次位移都重置计时,停住 250ms 才算
+     按住";手指一离开按钮范围就直接发。快速点击在 up 时补发。 */
+  var armStill=function(){
+    if(pend){clearTimeout(pend);}
+    pend=setTimeout(function(){pend=null;fireDown();},250);
+  };
   var arm=function(){
     pr=true;
-    if(inScrollNow()){ add(); pend=setTimeout(function(){pend=null;fireDown();},80); }
+    if(inScrollNow()){ add(); armStill(); }
     else fireDown();
   };
   var _tid=function(ts){var t;for(var i=0;i<ts.length;i++)if(ts[i].identifier===sTid){t=ts[i];break;}return t||ts[0];};
@@ -2064,7 +2071,10 @@ function _bindHoldEl(el,dcmd,ucmd,nocancel,norepeat){
     if(t.identifier!==sTid)return;
     if(Math.abs(t.clientX-sx)>14||Math.abs(t.clientY-sy)>14){
       sl=true; cancelAll();
+      return;
     }
+    if(sl)return;
+    armStill();          /* 小位移也重置静止计时 */
   };
   var up=function(e){
     if(e.type==='touchend'&&sl)return;
@@ -2790,7 +2800,7 @@ _initBtnRows();
    快速点击在 up 时补发一次，所以手感不变。 */
 var ESP_SLOP = 14;
 function _espGuard(b, fire, stopFn, repeatMs){
-  var sx=0, sy=0, pr=false, fired=false, pend=null, iv=null, sl=false, tid=null;
+  var sx=0, sy=0, pr=false, fired=false, pend=null, iv=null, sl=false, tid=null, still=null;
   var add=function(){b.classList.add('pressed');};
   var rem=function(){b.classList.remove('pressed');};
   var go=function(){
@@ -2799,34 +2809,45 @@ function _espGuard(b, fire, stopFn, repeatMs){
     if(repeatMs){iv=setInterval(fire, repeatMs);}
   };
   var cancelAll=function(){
+    if(still){clearTimeout(still);still=null;}
     if(pend){clearTimeout(pend);pend=null;}
     if(iv){clearInterval(iv);iv=null;}
     if(fired){fired=false;}
     pr=false; rem();
   };
   var moved=function(x,y){return Math.abs(x-sx)>ESP_SLOP||Math.abs(y-sy)>ESP_SLOP;};
-  var start=function(e){
-    if(e&&e.cancelable)e.preventDefault();
-    if(pr)return;
-    sx=e.clientX; sy=e.clientY; sl=false;
-    add(); pend=setTimeout(function(){pend=null;go();},80);
+  /* **静止计时** 取代固定延迟。原来的 80ms 定时对**慢速滑动**无效:
+     手指按下去慢慢划,80ms 时还在按钮上 → 已经发出去了,等移开才发现是滚动。
+     现在每次位移(哪怕只动 2~3px)都重置计时,手指连续移动就**永远不会**发;
+     手指真的停住 250ms 才算"按住"。快速点击仍然在 up 时立即补发。 */
+  var STILL_MS = 250;
+  var armStill=function(){
+    if(still){clearTimeout(still);still=null;}
+    still=setTimeout(function(){still=null;go();},STILL_MS);
   };
   var move=function(e){
-    if(sl||!pend)return;
-    if(moved(e.clientX,e.clientY)){sl=true;cancelAll();}
+    if(sl||!pr&&!pend&&!still)return;
+    if(moved(e.clientX,e.clientY)){sl=true;cancelAll();return;}
+    armStill();          /* 小位移也重置静止计时 */
+  };
+  var start=function(e){
+    if(e&&e.cancelable)e.preventDefault();
+    if(pr||still)return;
+    sx=e.clientX; sy=e.clientY; sl=false;
+    add(); armStill();
   };
   var up=function(e){
     if(e&&e.cancelable)e.preventDefault();
     /* touchmove 可能被滚动吃掉 —— 用最终坐标再判一次 */
     if(e&&e.clientX!==undefined&&moved(e.clientX,e.clientY)){sl=true;cancelAll();return;}
     if(sl){return;}
-    if(pend){clearTimeout(pend);pend=null;go();}   /* 快速点击：补发一次 */
+    if(!fired){go();}          /* 快速点击：到这里才发(静止计时还没到) */
     cancelAll();
     if(stopFn)stopFn();
   };
   /* pointercancel/pointerleave 是"手势被打断"(页面滚动抢走指针等),
      绝不能当成点击 —— 只取消 + 释放,不发。 */
-  var ab=function(){ if(pend){clearTimeout(pend);pend=null;} sl=true; cancelAll(); if(stopFn)stopFn(); };
+  var ab=function(){ sl=true; cancelAll(); if(stopFn)stopFn(); };
   b.addEventListener('pointerdown',start);
   b.addEventListener('pointermove',move);
   b.addEventListener('pointerup',up);
